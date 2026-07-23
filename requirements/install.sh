@@ -14,6 +14,7 @@ SGLANG_VERSION=""
 TRANSFORMERS_VERSION=""
 XGRAMMAR_VERSION=""
 PLATFORM="nvidia"
+CUDA_BACKEND=""
 ROCM_VERSION=""
 # PEP 440 local-version segment (including the leading '+') that
 # apply_torch_override appends to torch/torchvision/torchaudio overrides so uv
@@ -116,6 +117,10 @@ Common options:
                            (auto / rocm<version> / cpu); export UV_TORCH_BACKEND yourself to
                            bypass (e.g. UV_TORCH_BACKEND=cu124). Ascend uses CPU torch from PyPI
                            and adds torch-npu in install_ascend_extras.
+    --cuda-backend <tag>   NVIDIA CUDA wheel tag for --platform nvidia (e.g. cu128 for B200 /
+                           Blackwell sm_100+). Routes torch/torchvision/torchaudio through
+                           https://download.pytorch.org/whl/<tag> during uv sync. Also sets
+                           UV_TORCH_BACKEND=<tag> when unset. Ignored on other platforms.
     --rocm <version>       ROCm version for --platform amd. When unset, auto-detected from the
                            system (/opt/rocm/.info/version, hipconfig, rocminfo). Composes
                            UV_TORCH_BACKEND=rocm<version>. Ignored on other platforms.
@@ -189,6 +194,14 @@ parse_args() {
                     exit 1
                 fi
                 PLATFORM="${2:-}"
+                shift 2
+                ;;
+            --cuda-backend)
+                if [ -z "${2:-}" ]; then
+                    echo "--cuda-backend requires a tag argument (e.g. cu128)." >&2
+                    exit 1
+                fi
+                CUDA_BACKEND="${2:-}"
                 shift 2
                 ;;
             --rocm)
@@ -396,9 +409,6 @@ EOF
 }
 
 configure_nvidia() {
-    PLATFORM_TORCH_STR=""
-    PLATFORM_TORCH_INDEX=""
-    PLATFORM_TORCH_PACKAGES=()
     PLATFORM_VENV_EXPORTS=(
         "export NVIDIA_DRIVER_CAPABILITIES=all"
         "export VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json"
@@ -406,10 +416,31 @@ configure_nvidia() {
     )
     PLATFORM_FLASH_ATTN_INSTALL=1
     PLATFORM_FLASH_ATTN_PREBUILT=1
-    PLATFORM_RELAX_TORCHCODEC=0
     PLATFORM_EXTRA_OVERRIDES=()
-    if [ -z "${UV_TORCH_BACKEND:-}" ]; then
-        export UV_TORCH_BACKEND="$DEFAULT_BACKEND_NVIDIA"
+
+    if [ -n "$CUDA_BACKEND" ]; then
+        PLATFORM_TORCH_STR="+${CUDA_BACKEND}"
+        if [ "$USE_MIRRORS" -eq 1 ]; then
+            PLATFORM_TORCH_INDEX="https://mirrors.nju.edu.cn/pytorch/whl/${CUDA_BACKEND}"
+        else
+            PLATFORM_TORCH_INDEX="https://download.pytorch.org/whl/${CUDA_BACKEND}"
+        fi
+        PLATFORM_TORCH_PACKAGES=("torch" "torchvision" "torchaudio")
+        PLATFORM_RELAX_TORCHCODEC=1
+        if [ -z "$TORCH_VERSION" ]; then
+            TORCH_VERSION="2.7.1"
+        fi
+        if [ -z "${UV_TORCH_BACKEND:-}" ]; then
+            export UV_TORCH_BACKEND="$CUDA_BACKEND"
+        fi
+    else
+        PLATFORM_TORCH_STR=""
+        PLATFORM_TORCH_INDEX=""
+        PLATFORM_TORCH_PACKAGES=()
+        PLATFORM_RELAX_TORCHCODEC=0
+        if [ -z "${UV_TORCH_BACKEND:-}" ]; then
+            export UV_TORCH_BACKEND="$DEFAULT_BACKEND_NVIDIA"
+        fi
     fi
 }
 
@@ -501,6 +532,11 @@ configure_platform() {
     if [ -n "$ROCM_VERSION" ] && [ "$PLATFORM" != "amd" ]; then
         echo "[install.sh] WARNING: --rocm is only meaningful with --platform amd; ignoring on platform=${PLATFORM}." >&2
         ROCM_VERSION=""
+    fi
+
+    if [ -n "$CUDA_BACKEND" ] && [ "$PLATFORM" != "nvidia" ]; then
+        echo "[install.sh] WARNING: --cuda-backend is only meaningful with --platform nvidia; ignoring on platform=${PLATFORM}." >&2
+        CUDA_BACKEND=""
     fi
 
     case "$PLATFORM" in
