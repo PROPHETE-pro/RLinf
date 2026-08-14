@@ -174,10 +174,13 @@ conflicts = [
     ],
 ]
 override-dependencies = [
-    "torch==2.6.0",
-    "torchvision==0.21.0",
-    "torchaudio==2.6.0",
-    "torchcodec==0.2",
+    # B200 / Blackwell (sm_100+) needs cu128 wheels — use
+    # requirements/embodied/install_robotwin_b200.sh or
+    # requirements/embodied/fix_torch_cu128.sh instead of bare `uv sync`.
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+    "torchcodec>=0.5",
     "xgrammar==0.1.19",
     "uvloop==0.21.0",
     "tensorflow-addons==0.23.0 ; platform_machine == 'x86_64'",

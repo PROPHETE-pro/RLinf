@@ -54,6 +54,7 @@ class RoboTwinEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.use_custom_reward = cfg.use_custom_reward
+        self.use_dense_reward = bool(cfg.get("use_dense_reward", False))
 
         self.video_cfg = cfg.video_cfg
 
@@ -61,7 +62,7 @@ class RoboTwinEnv(gym.Env):
         self.record_metrics = record_metrics
         self._is_start = True
 
-        self.task_name = cfg.task_config.task_name
+        self._init_task_names()
 
         self.center_crop = cfg.get("center_crop", False)
         self._init_reset_state_ids()
@@ -77,19 +78,79 @@ class RoboTwinEnv(gym.Env):
                 self.num_envs, dtype=torch.long, device=self.device
             )
 
+    def _init_task_names(self):
+        """Resolve task_names and assign env_id % N (Robocasa-style even split)."""
+        task_names_raw = OmegaConf.select(self.cfg, "task_names", default=None)
+        if task_names_raw is None:
+            task_names_raw = OmegaConf.select(
+                self.cfg, "task_config.task_names", default=None
+            )
+        if task_names_raw is not None:
+            task_names = OmegaConf.to_container(task_names_raw, resolve=True)
+            if not isinstance(task_names, list):
+                task_names = [task_names]
+        else:
+            task_names = [self.cfg.task_config.task_name]
+
+        self.task_names = [str(name) for name in task_names]
+        self.num_tasks = len(self.task_names)
+        assert self.num_tasks >= 1, "task_names must be non-empty"
+        assert self.num_envs % self.num_tasks == 0, (
+            f"num_envs ({self.num_envs}) must be divisible by num_tasks ({self.num_tasks})"
+        )
+        total_num_envs = self.cfg.get("total_num_envs", None)
+        if total_num_envs is not None:
+            assert int(total_num_envs) % self.num_tasks == 0, (
+                f"total_num_envs ({total_num_envs}) must be divisible by "
+                f"num_tasks ({self.num_tasks})"
+            )
+
+        self.task_ids = [env_id % self.num_tasks for env_id in range(self.num_envs)]
+        self.task_ids_tensor = torch.as_tensor(
+            self.task_ids, dtype=torch.long, device=self.device
+        )
+        self.per_env_task_names = [self.task_names[i] for i in self.task_ids]
+        # Backward-compatible single-task field (first / only task).
+        self.task_name = self.task_names[0]
+        if not OmegaConf.select(self.cfg, "task_config.task_name", default=None):
+            OmegaConf.update(self.cfg, "task_config.task_name", self.task_name, merge=False)
+
     def _init_env(self):
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
 
-        from robotwin.envs.vector_env import VectorEnv
-
         env_seeds = self.reset_state_ids.tolist()
+        task_config = OmegaConf.to_container(self.cfg.task_config, resolve=True)
+        for key in ("use_dense_reward", "dense_shaping_coef", "dense_success_reward"):
+            if OmegaConf.select(self.cfg, key, default=None) is not None:
+                task_config[key] = self.cfg.get(key)
+        use_subproc = self.cfg.get("use_subproc_env", True)
 
-        self.venv = VectorEnv(
-            task_config=OmegaConf.to_container(self.cfg.task_config, resolve=True),
-            n_envs=self.num_envs,
-            env_seeds=env_seeds,
-        )
+        if use_subproc:
+            from rlinf.envs.robotwin.subproc_vector_env import SubprocVectorEnv
+
+            self.venv = SubprocVectorEnv(
+                task_config=task_config,
+                n_envs=self.num_envs,
+                env_seeds=env_seeds,
+                step_timeout_sec=self.cfg.get("subproc_step_timeout_sec", 60.0),
+                max_respawns=self.cfg.get("subproc_max_respawns", 10),
+                on_timeout=self.cfg.get("on_subenv_timeout", "truncate"),
+                per_env_task_names=self.per_env_task_names,
+            )
+        else:
+            if self.num_tasks > 1:
+                raise ValueError(
+                    "RoboTwin multitask (N>1) requires use_subproc_env=true "
+                    "so each SubEnv can receive its own task_name."
+                )
+            from robotwin.envs.vector_env import VectorEnv
+
+            self.venv = VectorEnv(
+                task_config=task_config,
+                n_envs=self.num_envs,
+                env_seeds=env_seeds,
+            )
 
     @property
     def device(self):
@@ -146,9 +207,24 @@ class RoboTwinEnv(gym.Env):
                 )
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
+            # Per-task success so N>1 metrics are not collapsed by averaging.
+            for task_idx, task_name in enumerate(self.task_names):
+                mask = self.task_ids_tensor == task_idx
+                # Non-matching envs stay False so aggregation over done envs of
+                # other tasks does not invent successes for this task; callers
+                # that need rates should group by task_ids / task-specific keys.
+                episode_info[f"success_once/{task_name}"] = (
+                    self.success_once & mask
+                ).clone()
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["task_ids"] = self.task_ids_tensor.clone()
+        for task_idx, task_name in enumerate(self.task_names):
+            mask = self.task_ids_tensor == task_idx
+            episode_info[f"return/{task_name}"] = torch.where(
+                mask, self.returns, torch.zeros_like(self.returns)
+            )
         infos["episode"] = episode_info
         return infos
 
@@ -201,6 +277,7 @@ class RoboTwinEnv(gym.Env):
             "wrist_images": batch_wrist_images,
             "states": batch_states,
             "task_descriptions": batch_instructions,
+            "task_ids": self.task_ids_tensor.clone(),
         }
 
         return extracted_obs
@@ -216,26 +293,60 @@ class RoboTwinEnv(gym.Env):
         else:
             return reward
 
-    def _cal_chunk_rewards(self, step_reward, chunk_step, terminations, infos):
-        n_steps_to_run = np.array(
-            [[0] for i in range(self.num_envs)]
-        )  # infos.get("n_steps_to_run", np.array([[0] for i in range(self.num_envs)]))
-
-        n_steps_to_run = torch.as_tensor(
-            np.array(n_steps_to_run).reshape(-1), device=self.device
+    def _to_tensor_reward(self, step_reward):
+        if isinstance(step_reward, torch.Tensor):
+            return step_reward.to(dtype=torch.float32, device=self.device)
+        return torch.as_tensor(
+            np.array(step_reward, dtype=np.float32).reshape(-1),
+            device=self.device,
         )
-        chunk_rewards = torch.zeros(self.num_envs, chunk_step, device=self.device)
+
+    def _apply_reward_delta(self, step_reward: torch.Tensor) -> torch.Tensor:
+        """Convert cumulative env rewards into per-chunk increments for PPO."""
+        reward_diff = step_reward - self.prev_step_reward
+        self.prev_step_reward = step_reward
+        return reward_diff
+
+    def _prepare_step_reward(
+        self,
+        step_reward,
+        terminations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize env reward into the incremental signal consumed by PPO."""
+        if self.use_custom_reward:
+            return self._calc_step_reward(terminations)
+
+        step_reward = self._to_tensor_reward(step_reward)
+        # gen_dense_reward_once returns cumulative absolute progress; always delta it.
+        if self.use_dense_reward or self.use_rel_reward:
+            return self._apply_reward_delta(step_reward)
+        return step_reward
+
+    def _cal_chunk_rewards(
+        self,
+        step_reward: torch.Tensor,
+        chunk_step: int,
+        terminations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map one env scalar reward onto the last action-chunk slot for PPO."""
+        chunk_rewards = torch.zeros(
+            self.num_envs, chunk_step, dtype=torch.float32, device=self.device
+        )
+        if chunk_step <= 0:
+            return chunk_rewards
+
+        reward_idx = chunk_step - 1
+        if self.use_custom_reward or self.use_dense_reward or self.use_rel_reward:
+            chunk_rewards[:, reward_idx] = step_reward
+            return chunk_rewards
+
+        # Legacy absolute-reward path: spread terminal reward across the chunk tail.
         for env_id in range(self.num_envs):
-            steps_left = n_steps_to_run[env_id]
             reward = step_reward[env_id]
-            start_idx = chunk_step - steps_left - 1
-
-            if terminations[env_id] and start_idx > 0:
-                if self.use_rel_reward:
-                    chunk_rewards[env_id, start_idx] = reward
-                else:
-                    chunk_rewards[env_id, start_idx:] = reward
-
+            if terminations[env_id]:
+                chunk_rewards[env_id, reward_idx:] = reward
+            elif reward != 0:
+                chunk_rewards[env_id, reward_idx] = reward
         return chunk_rewards
 
     def reset(
@@ -292,11 +403,7 @@ class RoboTwinEnv(gym.Env):
         if self.use_custom_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+            step_reward = self._prepare_step_reward(step_reward, terminations)
 
         self._elapsed_steps += actions.shape[1]
         truncated = self._elapsed_steps >= self.cfg.max_episode_steps
@@ -348,14 +455,10 @@ class RoboTwinEnv(gym.Env):
         if self.use_custom_reward:
             step_reward = self._calc_step_reward(terminations)
         else:
-            if isinstance(step_reward, list):
-                step_reward = torch.as_tensor(
-                    np.array(step_reward, dtype=np.float32).reshape(-1),
-                    device=self.device,
-                )
+            step_reward = self._prepare_step_reward(step_reward, terminations)
 
         chunk_rewards = self._cal_chunk_rewards(
-            step_reward, chunk_step, terminations, infos
+            step_reward, chunk_step, terminations
         )
 
         self._elapsed_steps += chunk_actions.shape[1]
@@ -420,16 +523,36 @@ class RoboTwinEnv(gym.Env):
         ):
             with open(self.cfg.seeds_path, "r") as f:
                 data = json.load(f)
-            success_seeds = data[self.task_name].get("success_seeds", None)
-            if success_seeds is not None:
+            # Multitask: concatenate partitioned success seeds from each task.
+            per_task_seeds = []
+            for task_name in self.task_names:
+                if task_name not in data:
+                    per_task_seeds = None
+                    break
+                success_seeds = data[task_name].get("success_seeds", None)
+                if success_seeds is None:
+                    per_task_seeds = None
+                    break
                 success_seeds = torch.as_tensor(success_seeds, dtype=torch.long)
-                self.success_seeds = partition_success_seeds(
+                partitioned = partition_success_seeds(
                     success_seeds,
                     base_seed=self.base_seed,
                     seed_offset=self.seed_offset,
                     total_num_processes=self.total_num_processes,
-                    num_group=self.num_group,
+                    num_group=max(1, self.num_group // self.num_tasks)
+                    if self.num_tasks > 1
+                    else self.num_group,
                 )
+                per_task_seeds.append(partitioned)
+
+            if per_task_seeds is not None and all(s.numel() > 0 for s in per_task_seeds):
+                # Round-robin merge so env_id % N maps to task N's seed pool.
+                min_len = min(s.numel() for s in per_task_seeds)
+                merged = []
+                for i in range(min_len):
+                    for task_idx in range(self.num_tasks):
+                        merged.append(per_task_seeds[task_idx][i])
+                self.success_seeds = torch.stack(merged)
                 self._current_seed_index = 0
             else:
                 self.success_seeds = None

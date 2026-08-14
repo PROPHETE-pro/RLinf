@@ -229,6 +229,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             min_replay_buffer_size=self.cfg.algorithm.replay_buffer.min_buffer_size,
             min_demo_buffer_size=min_demo_buffer_size,
             prefetch_size=self.cfg.algorithm.replay_buffer.get("prefetch_size", 10),
+            demo_ratio=float(self.cfg.algorithm.get("demo_ratio", 0.5)),
+            allow_demo_only=bool(
+                self.cfg.algorithm.get("allow_demo_only", False)
+                or self.cfg.runner.get("lwd_stage", "online") == "offline"
+            ),
         )
         self.buffer_dataloader = DataLoader(
             self.buffer_dataset,

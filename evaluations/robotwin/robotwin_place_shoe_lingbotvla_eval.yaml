@@ -82,5 +82,5 @@ rollout:
     noise_level: 0.7
     joint_logprob: False
     action_env_dim: 14
-    add_value_head: False
+    add_value_head: True
     safe_get_logprob: False

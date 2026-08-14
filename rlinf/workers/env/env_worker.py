@@ -15,6 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -38,6 +39,9 @@ from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
+from rlinf.utils.logging import log_progress, set_progress_state, start_progress_heartbeat
+from rlinf.utils.chunk_step_watchdog import create_chunk_step_watchdog
+from rlinf.utils.robotwin_hang_diagnostics import configure_from_cfg, enabled as hang_diag_enabled
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -60,6 +64,7 @@ class EnvWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        configure_from_cfg(self.cfg)
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -158,6 +163,36 @@ class EnvWorker(Worker):
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
+        # [RoboTwin hang mitigation] Process-level watchdog for SAPIEN/mplib chunk_step
+        # GIL hangs. Only enabled for env.train.env_type=robotwin (not libero/etc).
+        # Disabled when use_subproc_env=true (subprocess timeout handles hang per SubEnv).
+        # Set env.train.chunk_step_timeout_sec=0 to disable watchdog on robotwin thread mode.
+        _chunk_timeout = 0.0
+        _use_subproc = (
+            train_env_cfg is not None
+            and str(train_env_cfg.get("env_type", "")).lower() == "robotwin"
+            and bool(train_env_cfg.get("use_subproc_env", True))
+        )
+        if (
+            self.enable_train
+            and train_env_cfg is not None
+            and hang_diag_enabled()
+            and not _use_subproc
+        ):
+            _chunk_timeout = float(
+                train_env_cfg.get("chunk_step_timeout_sec", 60.0)
+            )
+        self.chunk_step_timeout_sec = _chunk_timeout
+        self._chunk_step_watchdog = create_chunk_step_watchdog(
+            _chunk_timeout if self.enable_train else 0.0,
+            rank=self._rank,
+        )
+        if self._chunk_step_watchdog is not None:
+            self.log_info(
+                f"chunk_step watchdog enabled (robotwin train only): "
+                f"timeout={self.chunk_step_timeout_sec:.1f}s "
+                f"(normal chunk_step ~2-3s; set env.train.chunk_step_timeout_sec=0 to disable)"
+            )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
 
@@ -438,6 +473,16 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
+        import time as _time
+
+        _t0 = _time.time()
+        set_progress_state(
+            "Env",
+            f"env_interact_step: enter stage={stage_id}",
+            rank=self._rank,
+            extra="prepare_actions",
+            all_ranks=True,
+        )
         exec_actions = prepare_actions(
             raw_chunk_actions=chunk_actions["raw_actions"]
             if isinstance(chunk_actions, dict)
@@ -456,8 +501,37 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
-        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+        set_progress_state(
+            "Env",
+            f"env_interact_step: before chunk_step stage={stage_id}",
+            rank=self._rank,
+            all_ranks=True,
+        )
+        # Arm external watchdog only around chunk_step (not recv/send/predict).
+        _chunk_guard = (
+            self._chunk_step_watchdog.guard(stage_id=stage_id)
+            if getattr(self, "_chunk_step_watchdog", None) is not None
+            else nullcontext()
+        )
+        try:
+            with _chunk_guard:
+                obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
+                    self.env_list[stage_id].chunk_step(chunk_actions)
+                )
+        except Exception as e:
+            set_progress_state(
+                "Env",
+                f"env_interact_step: chunk_step EXCEPTION {type(e).__name__}: {e}",
+                rank=self._rank,
+                all_ranks=True,
+            )
+            raise
+        set_progress_state(
+            "Env",
+            f"env_interact_step: after chunk_step stage={stage_id} "
+            f"dt={_time.time() - _t0:.2f}s",
+            rank=self._rank,
+            all_ranks=True,
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -981,14 +1055,31 @@ class EnvWorker(Worker):
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
     ):
+        log_progress(
+            "Env",
+            f"rank={self._rank} send_rollout_trajectories: start "
+            f"(split_num={self.actor_split_num})",
+            rank=self._rank,
+        )
         trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
             self.actor_split_num
         )
         rollout_result.clear()
-        for trajectory in trajectories:
+        for i, trajectory in enumerate(trajectories):
+            log_progress(
+                "Env",
+                f"rank={self._rank} send_rollout_trajectories: put {i + 1}/{len(trajectories)}",
+                rank=self._rank,
+            )
             channel.put(trajectory, async_op=True)
         del trajectories
         gc.collect()
+        log_progress(
+            "Env",
+            f"rank={self._rank} send_rollout_trajectories: done",
+            rank=self._rank,
+            all_ranks=True,
+        )
 
     @Worker.timer("env/send_lerobot_episodes")
     async def send_lerobot_episodes(
@@ -1025,12 +1116,31 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
 
+        log_progress(
+            "Env",
+            f"rank={self._rank} interact begin: "
+            f"rollout_epoch={self.rollout_epoch}, "
+            f"n_train_chunk_steps={self.n_train_chunk_steps}, "
+            f"stage_num={self.stage_num}",
+            rank=self._rank,
+        )
         for epoch in range(self.rollout_epoch):
+            log_progress(
+                "Env",
+                f"rank={self._rank} epoch {epoch + 1}/{self.rollout_epoch}: bootstrap start",
+                rank=self._rank,
+            )
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            log_progress(
+                "Env",
+                f"rank={self._rank} epoch {epoch + 1}/{self.rollout_epoch}: "
+                f"bootstrap done, enter chunk loop",
+                rank=self._rank,
+            )
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1058,6 +1168,14 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
+                    set_progress_state(
+                        "Env",
+                        f"epoch {epoch + 1}/{self.rollout_epoch} "
+                        f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                        f"stage={stage_id}: waiting recv actions from Rollout",
+                        rank=self._rank,
+                        all_ranks=True,
+                    )
                     rollout_result = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
                         channel=input_channel,
@@ -1067,6 +1185,14 @@ class EnvWorker(Worker):
                         merge_fn=RolloutResult.merge_rollout_results,
                         infer_batch_size_fn=self._infer_rollout_batch_size,
                         decoupled_mode=self.env_decoupled_mode,
+                    )
+                    set_progress_state(
+                        "Env",
+                        f"epoch {epoch + 1}/{self.rollout_epoch} "
+                        f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                        f"stage={stage_id}: got actions, calling env_interact_step",
+                        rank=self._rank,
+                        all_ranks=True,
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1123,6 +1249,14 @@ class EnvWorker(Worker):
                             **chunk_step_payload,
                         )
                     env_batch = env_output.to_dict()
+                    set_progress_state(
+                        "Env",
+                        f"epoch {epoch + 1}/{self.rollout_epoch} "
+                        f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                        f"stage={stage_id}: send_to next obs -> Rollout",
+                        rank=self._rank,
+                        all_ranks=True,
+                    )
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
@@ -1131,6 +1265,14 @@ class EnvWorker(Worker):
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
+                    )
+                    set_progress_state(
+                        "Env",
+                        f"epoch {epoch + 1}/{self.rollout_epoch} "
+                        f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                        f"stage={stage_id}: send_to done",
+                        rank=self._rank,
+                        all_ranks=True,
                     )
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
@@ -1173,6 +1315,19 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
+                log_progress(
+                    "Env",
+                    f"rank={self._rank} epoch {epoch + 1}/{self.rollout_epoch} "
+                    f"stage={stage_id}: waiting final bootstrap recv from Rollout",
+                    rank=self._rank,
+                )
+                set_progress_state(
+                    "Env",
+                    f"epoch {epoch + 1}/{self.rollout_epoch} "
+                    f"stage={stage_id}: waiting final bootstrap recv from Rollout",
+                    rank=self._rank,
+                    all_ranks=True,
+                )
                 rollout_result = self.recv_from(
                     group_name=self.cfg.rollout.group_name,
                     channel=input_channel,
@@ -1182,6 +1337,13 @@ class EnvWorker(Worker):
                     merge_fn=RolloutResult.merge_rollout_results,
                     infer_batch_size_fn=self._infer_rollout_batch_size,
                     decoupled_mode=self.env_decoupled_mode,
+                )
+                set_progress_state(
+                    "Env",
+                    f"epoch {epoch + 1}/{self.rollout_epoch} "
+                    f"stage={stage_id}: final bootstrap recv done",
+                    rank=self._rank,
+                    all_ranks=True,
                 )
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1221,8 +1383,19 @@ class EnvWorker(Worker):
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
+            log_progress(
+                "Env",
+                f"rank={self._rank} epoch {epoch + 1}/{self.rollout_epoch}: done",
+                rank=self._rank,
+            )
 
         if not self.use_training_pipeline and actor_channel is not None:
+            log_progress(
+                "Env",
+                f"rank={self._rank} sending all trajectories to Actor",
+                rank=self._rank,
+                all_ranks=True,
+            )
             if self.enable_online_lerobot:
                 for stage_id in range(self.stage_num):
                     episodes = self.rollout_results[stage_id].drain_episodes()
@@ -1236,6 +1409,9 @@ class EnvWorker(Worker):
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
+        log_progress(
+            "Env", f"rank={self._rank} interact finished", rank=self._rank
+        )
         return env_metrics
 
     @Worker.timer("interact")
@@ -1246,6 +1422,9 @@ class EnvWorker(Worker):
         reward_channel: Channel | None,
         actor_channel: Channel | None = None,
     ):
+        log_progress("Env", f"rank={self._rank} interact() entered", rank=self._rank, all_ranks=True)
+        start_progress_heartbeat(component="Env", rank=self._rank)
+        set_progress_state("Env", "interact: entered", rank=self._rank, all_ranks=True)
         env_metrics = await self._run_interact_once(
             input_channel,
             rollout_channel,
@@ -1258,6 +1437,12 @@ class EnvWorker(Worker):
             if self.train_enable_offload:
                 get_env_attr(env, "offload")()
 
+        log_progress(
+            "Env",
+            f"rank={self._rank} interact() returning",
+            rank=self._rank,
+            all_ranks=True,
+        )
         return env_metrics
 
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):

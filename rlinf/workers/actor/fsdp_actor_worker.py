@@ -67,6 +67,8 @@ from rlinf.utils.metric_utils import (
     compute_split_num,
     pop_critic_explained_variance_stats,
 )
+from rlinf.utils.logging import log_progress, set_progress_state, start_progress_heartbeat
+from rlinf.utils.robotwin_hang_diagnostics import configure_from_cfg
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
@@ -81,6 +83,7 @@ from rlinf.utils.utils import (
     compute_logprobs_from_logits,
     cpu_weight_swap,
     get_loss_agg_func,
+    load_runner_ckpt_state_dict,
     masked_mean,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
@@ -1031,6 +1034,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
+        configure_from_cfg(self.cfg)
         self._env_group_name = cfg.env.group_name
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -1042,6 +1046,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        self._init_sft_co_train_options()
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1087,8 +1092,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model = super().model_provider_func()
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
-            model.load_state_dict(model_dict)
+            keep_critic_weight = bool(
+                self.cfg.runner.get("keep_critic_weight", False)
+            )
+            model_dict = load_runner_ckpt_state_dict(
+                self.cfg.runner.ckpt_path,
+                keep_critic_weight=keep_critic_weight,
+            )
+            # strict=False when critic keys are dropped so random value_head remains.
+            model.load_state_dict(model_dict, strict=keep_critic_weight)
 
         return model
 
@@ -1097,6 +1109,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
+        log_progress(
+            "Actor",
+            f"rank={self._rank} sync_model_to_rollout: start",
+            rank=self._rank,
+        )
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
@@ -1129,6 +1146,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             ).async_wait()
 
         if not self.weight_syncer.sender_initialized():
+            log_progress(
+                "Actor",
+                f"rank={self._rank} sync_model_to_rollout: init_sender",
+                rank=self._rank,
+            )
             await self.weight_syncer.init_sender(
                 state_dict=state_dict,
                 send=send_func,
@@ -1142,6 +1164,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if hasattr(self, "get_rollout_sync_version")
             else self.version
         )
+        log_progress(
+            "Actor",
+            f"rank={self._rank} sync_model_to_rollout: sync(version={version})",
+            rank=self._rank,
+        )
         await self.weight_syncer.sync(state_dict, send_func, version=version)
 
         if self.enable_offload:
@@ -1149,6 +1176,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "weight should be offloaded in sync_model_to_rollout"
             )
             self.offload_param_and_grad(True)
+        log_progress(
+            "Actor",
+            f"rank={self._rank} sync_model_to_rollout: done",
+            rank=self._rank,
+        )
 
     @Worker.timer("actor/recv_traj")
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
@@ -1164,14 +1196,40 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
 
+        start_progress_heartbeat(component="Actor", rank=self._rank)
+        set_progress_state(
+            "Actor",
+            f"recv_rollout_trajectories: start "
+            f"(expect {split_num} chunks, send_num={send_num}, recv_num={recv_num})",
+            rank=self._rank,
+            all_ranks=True,
+        )
         recv_list = []
-        for _ in range(split_num):
+        for i in range(split_num):
+            set_progress_state(
+                "Actor",
+                f"recv_rollout_trajectories: waiting chunk {i + 1}/{split_num}",
+                rank=self._rank,
+                all_ranks=True,
+            )
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
+            log_progress(
+                "Actor",
+                f"rank={self._rank} recv_rollout_trajectories: "
+                f"got chunk {i + 1}/{split_num}",
+                rank=self._rank,
+            )
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        log_progress(
+            "Actor",
+            f"rank={self._rank} recv_rollout_trajectories: done",
+            rank=self._rank,
+            all_ranks=True,
+        )
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1255,6 +1313,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        log_progress(
+            "Actor",
+            f"rank={self._rank} compute_advantages_and_returns: start",
+            rank=self._rank,
+        )
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1278,7 +1341,137 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        log_progress(
+            "Actor",
+            f"rank={self._rank} compute_advantages_and_returns: done",
+            rank=self._rank,
+        )
         return rollout_metrics
+
+    def _init_sft_co_train_options(self) -> None:
+        """Optional co-train enhancements (see actor.sft_co_train in yaml)."""
+        sft_cfg = self.cfg.actor.get("sft_co_train", {})
+        if sft_cfg is None:
+            sft_cfg = {}
+        self.sft_dynamic_loss_norm = bool(sft_cfg.get("dynamic_loss_norm", False))
+        self.sft_target_loss_ratio = float(sft_cfg.get("target_loss_ratio", 0.5))
+        self.sft_only_global_steps = int(sft_cfg.get("sft_only_global_steps", 0))
+        self.sft_rollout_success = bool(sft_cfg.get("rollout_success_sft", False))
+        self.sft_rollout_success_ratio = float(
+            sft_cfg.get("rollout_success_sft_ratio", 1.0)
+        )
+        self.sft_offline_ratio = float(sft_cfg.get("offline_sft_ratio", 1.0))
+        if self.sft_only_global_steps > 0 and self.critic_warmup_steps > 0:
+            self.log_on_first_rank(
+                "Disabling critic_warmup_steps because sft_only_global_steps "
+                f"({self.sft_only_global_steps}) requires policy updates via SFT."
+            )
+            self.critic_warmup_steps = 0
+
+    def _in_sft_only_phase(self) -> bool:
+        return (
+            self.enable_sft_co_train
+            and self.sft_only_global_steps > 0
+            and self.version < self.sft_only_global_steps
+        )
+
+    def _in_critic_warmup_phase(self) -> bool:
+        return (
+            self.critic_warmup_steps > 0
+            and self.optimizer_steps < self.critic_warmup_steps
+        )
+
+    def _micro_batch_has_rollout_success(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> bool:
+        rewards = micro_batch.get("rewards")
+        if rewards is None:
+            return False
+        if rewards.dim() >= 2:
+            return bool(rewards.reshape(rewards.shape[0], -1).amax(dim=-1).any())
+        return bool((rewards > 0).any())
+
+    def _global_rollout_success_active(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> bool:
+        """True if any actor rank has rollout success in this micro-batch."""
+        local_flag = int(self._micro_batch_has_rollout_success(micro_batch))
+        if self._world_size <= 1:
+            return bool(local_flag)
+        global_flag = all_reduce_int(
+            local_flag, op=torch.distributed.ReduceOp.MAX
+        )
+        return global_flag > 0
+
+    def _compute_rollout_success_sft_loss(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor | None:
+        forward_inputs = micro_batch.get("forward_inputs")
+        rewards = micro_batch.get("rewards")
+        if forward_inputs is None or rewards is None:
+            return None
+
+        if rewards.dim() >= 2:
+            success_mask = rewards.reshape(rewards.shape[0], -1).amax(dim=-1) > 0
+        else:
+            success_mask = rewards > 0
+
+        if not success_mask.any():
+            return None
+
+        filtered: dict[str, torch.Tensor] = {}
+        batch_size = success_mask.shape[0]
+        for key, value in forward_inputs.items():
+            if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
+                filtered[key] = value[success_mask]
+
+        if not filtered:
+            return None
+
+        if not hasattr(self.model, "prepare_dagger_sft_batch"):
+            return None
+
+        data = self.model.prepare_dagger_sft_batch(filtered)
+        return self.model(
+            data=data,
+            forward_type=ForwardType.SFT,
+            use_action_chunk_loss=True,
+        )
+
+    def _compute_zero_rollout_success_sft_loss(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Run a full SFT forward with zero grad for FSDP rank sync."""
+        forward_inputs = micro_batch.get("forward_inputs")
+        if forward_inputs is not None and hasattr(
+            self.model, "prepare_dagger_sft_batch"
+        ):
+            filtered: dict[str, torch.Tensor] = {}
+            for key, value in forward_inputs.items():
+                if isinstance(value, torch.Tensor) and value.shape[0] > 0:
+                    filtered[key] = value[:1]
+            if filtered:
+                data = self.model.prepare_dagger_sft_batch(filtered)
+                loss = self.model(
+                    data=data,
+                    forward_type=ForwardType.SFT,
+                    use_action_chunk_loss=True,
+                )
+                return loss * 0.0
+
+        for param in self.model.parameters():
+            if param.requires_grad:
+                return param.reshape(-1)[0] * 0.0
+        device = Worker.torch_platform.current_device()
+        return torch.zeros((), device=device, requires_grad=True)
+
+    def _compute_rollout_success_sft_loss_for_backward(
+        self, micro_batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        loss = self._compute_rollout_success_sft_loss(micro_batch)
+        if loss is not None:
+            return loss
+        return self._compute_zero_rollout_success_sft_loss(micro_batch)
 
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
@@ -1315,51 +1508,217 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
             )
 
-    def _train_sft_epoch(
-        self, metrics_data: dict[str, torch.Tensor], loss: torch.Tensor
+    def _enable_policy_grad_for_sft(self) -> list[str]:
+        """Re-enable policy grads when value-head warmup froze them but SFT must train."""
+        enabled: list[str] = []
+        for name, param in self.model.named_parameters():
+            if "value_head" in name or "model.value_head" in name:
+                continue
+            if not param.requires_grad:
+                param.requires_grad = True
+                enabled.append(name)
+        return enabled
+
+    def _restore_policy_grad_after_sft(self, enabled_names: list[str]) -> None:
+        if not self._in_critic_warmup_phase():
+            return
+        for name, param in self.model.named_parameters():
+            if name in enabled_names:
+                param.requires_grad = False
+
+    def _skip_sft_during_critic_warmup(self, metrics_data: dict) -> bool:
+        """Skip SFT co-train updates while only the critic is training."""
+        if not self._in_critic_warmup_phase():
+            return False
+        metrics_data["sft_loss"] = 0.0
+        metrics_data["sft_co_train/scaled_sft"] = 0.0
+        metrics_data["sft_co_train/skipped_critic_warmup"] = 1.0
+        if self.sft_rollout_success:
+            metrics_data["sft_loss/rollout_success"] = 0.0
+        return True
+
+    def _scale_single_sft_term(
+        self,
+        ppo_loss_value: float,
+        sft_loss: torch.Tensor,
+        weight: float,
     ) -> torch.Tensor:
-        """
-        Train one epoch of SFT.
-        """
-        metrics_data["ppo_loss"] = loss.clone().detach().item()
+        if self._in_sft_only_phase() and self.sft_dynamic_loss_norm:
+            sft_mag = torch.abs(sft_loss.detach()).clamp(min=1e-8)
+            scale = self.sft_target_loss_ratio / sft_mag
+            return self.sft_loss_weight * weight * sft_loss * scale
 
-        # Get next data batch
-        try:
-            observation, actions = next(self.sft_iterator)
-        except StopIteration:
-            self.train_epoch += 1
-            self.data_loader.set_epoch(self.train_epoch)
-            self.sft_iterator = iter(self.data_loader)
-            observation, actions = next(self.sft_iterator)
+        if self.sft_dynamic_loss_norm:
+            ppo_mag = max(abs(ppo_loss_value), 1e-8)
+            sft_mag = torch.abs(sft_loss.detach()).clamp(min=1e-8)
+            scale = (self.sft_target_loss_ratio * ppo_mag) / sft_mag
+            return self.sft_loss_weight * weight * sft_loss * scale
 
-        sft_loss = self.model(
-            data=(observation, actions),
-            forward_type=ForwardType.SFT,
+        return self.sft_loss_weight * weight * sft_loss
+
+    def _backward_sft_co_train_terms(
+        self,
+        metrics_data: dict,
+        ppo_loss_value: float,
+        micro_batch: dict[str, torch.Tensor] | None,
+        grad_scale_divisor: float,
+    ) -> None:
+        """Run each SFT term as an immediate forward/backward pair.
+
+        Batching multiple checkpointed forwards before backward triggers
+        torch.utils.checkpoint.CheckpointError when co-training with PPO.
+        """
+        if self._skip_sft_during_critic_warmup(metrics_data):
+            return
+
+        need_policy_grad = self._in_sft_only_phase()
+        enabled_grad_names: list[str] = []
+        if need_policy_grad:
+            enabled_grad_names = self._enable_policy_grad_for_sft()
+
+        planned_terms: list[tuple[str, float]] = []
+        if self.sft_offline_ratio > 0:
+            planned_terms.append(("offline", self.sft_offline_ratio))
+        global_rollout_success = (
+            self.sft_rollout_success
+            and micro_batch is not None
+            and self._global_rollout_success_active(micro_batch)
         )
-        metrics_data["sft_loss"] = sft_loss.detach().item()
-        total_loss = loss + self.sft_loss_weight * sft_loss
-        loss = total_loss
+        if global_rollout_success:
+            planned_terms.append(
+                ("rollout_success", self.sft_rollout_success_ratio)
+            )
 
+        if not planned_terms:
+            self._restore_policy_grad_after_sft(enabled_grad_names)
+            if self._in_sft_only_phase():
+                raise RuntimeError(
+                    "SFT-only co-train phase produced no SFT loss terms. "
+                    "Check sft_data_path and sft_co_train.offline_sft_ratio."
+                )
+            metrics_data["sft_loss"] = 0.0
+            if self.sft_rollout_success:
+                metrics_data["sft_loss/rollout_success"] = 0.0
+            return
+
+        total_weight = sum(weight for _, weight in planned_terms)
+        raw_loss_sum = 0.0
+        scaled_loss_sum = 0.0
+
+        try:
+            for name, weight in planned_terms:
+                normalized_weight = weight / total_weight
+                if name == "offline":
+                    try:
+                        observation, actions = next(self.sft_iterator)
+                    except StopIteration:
+                        self.train_epoch += 1
+                        self.data_loader.set_epoch(self.train_epoch)
+                        self.sft_iterator = iter(self.data_loader)
+                        observation, actions = next(self.sft_iterator)
+
+                    sft_loss = self.model(
+                        data=(observation, actions),
+                        forward_type=ForwardType.SFT,
+                    )
+                else:
+                    sft_loss = self._compute_rollout_success_sft_loss_for_backward(
+                        micro_batch
+                    )
+                    if not self._micro_batch_has_rollout_success(micro_batch):
+                        metrics_data["sft_loss/rollout_success"] = 0.0
+
+                scaled = self._scale_single_sft_term(
+                    ppo_loss_value, sft_loss, normalized_weight
+                )
+                metrics_data[f"sft_loss/{name}"] = sft_loss.detach().item()
+                self.grad_scaler.scale(scaled / grad_scale_divisor).backward()
+                if name != "rollout_success" or self._micro_batch_has_rollout_success(
+                    micro_batch
+                ):
+                    raw_loss_sum += sft_loss.detach().item() * normalized_weight
+                scaled_loss_sum += scaled.detach().item()
+        finally:
+            self._restore_policy_grad_after_sft(enabled_grad_names)
+
+        metrics_data["sft_loss"] = float(raw_loss_sum)
+        metrics_data["sft_co_train/scaled_sft"] = float(scaled_loss_sum)
         metrics_data["loss_ratio"] = (
-            np.abs(metrics_data["sft_loss"]) / np.abs(metrics_data["ppo_loss"])
-            if np.abs(metrics_data["ppo_loss"]) > 0
+            np.abs(metrics_data["sft_loss"]) / np.abs(ppo_loss_value)
+            if np.abs(ppo_loss_value) > 0
             else float("inf")
         )
-        if metrics_data["loss_ratio"] > 1e5:
+        if metrics_data["loss_ratio"] > 1e5 and not self.sft_dynamic_loss_norm:
             self.logger.warning(
                 "SFT/PPO loss imbalance detected: "
                 f"ratio={metrics_data['loss_ratio']:.3e}, "
                 f"sft_loss={metrics_data['sft_loss']:.6f}, "
-                f"ppo_loss={metrics_data['ppo_loss']:.6f}, "
+                f"ppo_loss={ppo_loss_value:.6f}, "
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
-        return loss
+
+    def _train_sft_epoch(
+        self,
+        metrics_data: dict[str, torch.Tensor],
+        loss: torch.Tensor,
+        micro_batch: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Legacy combined SFT loss path (used by NFT co-train)."""
+        ppo_loss_value = (
+            loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
+        )
+        metrics_data["ppo_loss"] = ppo_loss_value
+
+        if self._in_critic_warmup_phase():
+            return loss
+
+        need_policy_grad = self._in_sft_only_phase()
+        enabled_grad_names: list[str] = []
+        if need_policy_grad:
+            enabled_grad_names = self._enable_policy_grad_for_sft()
+
+        weighted_sft_terms: list[tuple[torch.Tensor, float]] = []
+        try:
+            if self.sft_offline_ratio > 0:
+                try:
+                    observation, actions = next(self.sft_iterator)
+                except StopIteration:
+                    self.train_epoch += 1
+                    self.data_loader.set_epoch(self.train_epoch)
+                    self.sft_iterator = iter(self.data_loader)
+                    observation, actions = next(self.sft_iterator)
+
+                offline_sft = self.model(
+                    data=(observation, actions),
+                    forward_type=ForwardType.SFT,
+                )
+                weighted_sft_terms.append((offline_sft, self.sft_offline_ratio))
+                metrics_data["sft_loss/offline"] = offline_sft.detach().item()
+        finally:
+            self._restore_policy_grad_after_sft(enabled_grad_names)
+
+        if not weighted_sft_terms:
+            return loss
+
+        total_weight = sum(weight for _, weight in weighted_sft_terms)
+        combined_sft = sum(
+            term * weight for term, weight in weighted_sft_terms
+        ) / total_weight
+        metrics_data["sft_loss"] = combined_sft.detach().item()
+        scaled_sft = self._scale_single_sft_term(
+            ppo_loss_value, combined_sft, 1.0
+        )
+        metrics_data["sft_co_train/scaled_sft"] = scaled_sft.detach().item()
+        return loss + scaled_sft if loss.requires_grad else scaled_sft
 
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
         Run the training process using the received rollout batch.
         """
+        log_progress(
+            "Actor", f"rank={self._rank} run_training: start", rank=self._rank
+        )
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
@@ -1388,7 +1747,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        for epoch_idx in range(update_epoch):
+            log_progress(
+                "Actor",
+                f"rank={self._rank} run_training: update_epoch "
+                f"{epoch_idx + 1}/{update_epoch}",
+                rank=self._rank,
+            )
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
@@ -1448,6 +1813,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 compute_critic_explained_variance_from_stats(reduced_stats).item()
             )
 
+        log_progress(
+            "Actor", f"rank={self._rank} run_training: done", rank=self._rank
+        )
         return mean_metric_dict
 
     def train_micro_batch(
@@ -1483,82 +1851,113 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kwargs["prev_logprobs"] = prev_logprobs
 
         compute_values = self.cfg.algorithm.adv_type == "gae"
-        with self.amp_context:
-            output_dict = self.model(
-                forward_inputs=forward_inputs,
-                compute_logprobs=True,
-                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                compute_values=compute_values,
-                use_cache=False,
-                **kwargs,
-            )
+        ppo_loss = None
+        metrics_data: dict = {}
+        metrics_data["sft_co_train/sft_only_phase"] = float(self._in_sft_only_phase())
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.GR00T,
-            SupportedModel.GR00T_N1D6,
-            SupportedModel.GR00T_N1D7,
-            SupportedModel.ABOT_M0,
-        ]:
-            prev_logprobs = output_dict["prev_logprobs"]
-
-        loss_kwargs = {
-            "loss_type": self.cfg.algorithm.loss_type,
-            "logprob_type": self.cfg.algorithm.logprob_type,
-            "reward_type": self.cfg.algorithm.reward_type,
-            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-            "logprobs": output_dict["logprobs"],
-            "values": output_dict.get("values", None),
-            "old_logprobs": prev_logprobs,
-            "advantages": advantages,
-            "returns": returns,
-            "prev_values": prev_values,
-            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-            "value_clip": self.cfg.algorithm.get("value_clip", None),
-            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-            "loss_mask": loss_mask,
-            "loss_mask_sum": loss_mask_sum,
-            "max_episode_steps": self.cfg.env.train.max_episode_steps,
-            "task_type": self.cfg.runner.task_type,
-            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
-        }
-
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.GR00T_N1D6,
-            SupportedModel.GR00T_N1D7,
-        ]:
-            loss_kwargs["clip_ratio_c"] = self.cfg.algorithm.get("clip_ratio_c", 3.0)
-            if self.cfg.algorithm.get("clip_log_ratio_min") is not None:
-                loss_kwargs["clip_log_ratio_min"] = (
-                    self.cfg.algorithm.clip_log_ratio_min
-                )
-            if self.cfg.algorithm.get("clip_log_ratio_max") is not None:
-                loss_kwargs["clip_log_ratio_max"] = (
-                    self.cfg.algorithm.clip_log_ratio_max
+        if not self._in_sft_only_phase():
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                    compute_values=compute_values,
+                    use_cache=False,
+                    **kwargs,
                 )
 
-        loss, metrics_data = policy_loss(**loss_kwargs)
-        entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
-        if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
-            entropy = output_dict["entropy"]
-            entropy = reshape_entropy(
-                entropy,
-                entropy_type=self.cfg.algorithm.entropy_type,
-                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                batch_size=output_dict["logprobs"].shape[0],
+            if SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.GR00T,
+                SupportedModel.GR00T_N1D6,
+                SupportedModel.GR00T_N1D7,
+                SupportedModel.ABOT_M0,
+            ]:
+                prev_logprobs = output_dict["prev_logprobs"]
+
+            loss_kwargs = {
+                "loss_type": self.cfg.algorithm.loss_type,
+                "logprob_type": self.cfg.algorithm.logprob_type,
+                "reward_type": self.cfg.algorithm.reward_type,
+                "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                "logprobs": output_dict["logprobs"],
+                "values": output_dict.get("values", None),
+                "old_logprobs": prev_logprobs,
+                "advantages": advantages,
+                "returns": returns,
+                "prev_values": prev_values,
+                "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                "value_clip": self.cfg.algorithm.get("value_clip", None),
+                "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                "loss_mask": loss_mask,
+                "loss_mask_sum": loss_mask_sum,
+                "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                "task_type": self.cfg.runner.task_type,
+                "critic_warmup": self._in_critic_warmup_phase(),
+            }
+
+            if SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.GR00T_N1D6,
+                SupportedModel.GR00T_N1D7,
+            ]:
+                loss_kwargs["clip_ratio_c"] = self.cfg.algorithm.get("clip_ratio_c", 3.0)
+                if self.cfg.algorithm.get("clip_log_ratio_min") is not None:
+                    loss_kwargs["clip_log_ratio_min"] = (
+                        self.cfg.algorithm.clip_log_ratio_min
+                    )
+                if self.cfg.algorithm.get("clip_log_ratio_max") is not None:
+                    loss_kwargs["clip_log_ratio_max"] = (
+                        self.cfg.algorithm.clip_log_ratio_max
+                    )
+
+            ppo_loss, metrics_data = policy_loss(**loss_kwargs)
+            entropy_loss = torch.tensor(
+                0.0, device=Worker.torch_platform.current_device()
             )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
-            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+            if (
+                self.cfg.algorithm.entropy_bonus > 0
+                and not loss_kwargs["critic_warmup"]
+            ):
+                entropy = output_dict["entropy"]
+                entropy = reshape_entropy(
+                    entropy,
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                    batch_size=output_dict["logprobs"].shape[0],
+                )
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                ppo_loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+            metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+        else:
+            metrics_data["ppo_loss"] = 0.0
+            metrics_data["actor/entropy_loss"] = 0.0
 
-        if self.enable_sft_co_train:
-            loss = self._train_sft_epoch(metrics_data, loss)
+        ppo_loss_value = (
+            ppo_loss.detach().item()
+            if isinstance(ppo_loss, torch.Tensor)
+            else float(metrics_data.get("ppo_loss", 0.0))
+        )
+        metrics_data["ppo_loss"] = ppo_loss_value
 
-        loss /= self.gradient_accumulation
+        grad_scale_divisor = float(self.gradient_accumulation)
         with backward_ctx:
-            self.grad_scaler.scale(loss).backward()
+            if ppo_loss is not None and ppo_loss.requires_grad:
+                self.grad_scaler.scale(ppo_loss / grad_scale_divisor).backward()
 
-        metrics_data["actor/total_loss"] = loss.detach().item()
+            if self.enable_sft_co_train:
+                self._backward_sft_co_train_terms(
+                    metrics_data,
+                    ppo_loss_value,
+                    micro_batch,
+                    grad_scale_divisor,
+                )
+            elif self._in_sft_only_phase():
+                raise RuntimeError(
+                    "SFT-only co-train phase requires enable_sft_co_train=True."
+                )
+
+        total_loss_value = ppo_loss_value + metrics_data.get("sft_co_train/scaled_sft", 0.0)
+        metrics_data["actor/total_loss"] = total_loss_value
         append_to_dict(metrics, metrics_data)
 
     def set_global_step(self, global_step: int) -> None:

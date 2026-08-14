@@ -28,6 +28,7 @@ from openpi.training.config import (
     TrainConfig,
 )
 
+from rlinf.data.lerobot_paths import resolve_lerobot_dataset_root
 from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
     LeRobotBehaviorDataConfig,
 )
@@ -72,6 +73,9 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 )
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
+)
+from rlinf.models.embodiment.openpi.dataconfig.robotwin_multitask_dataconfig import (
+    LeRobotRoboTwinMultiTaskDataConfig,
 )
 
 _CONFIGS = [
@@ -425,6 +429,25 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     TrainConfig(
+        name="pi05_robotwin_4task",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=True,
+            action_horizon=50,
+            max_token_len=250,
+        ),
+        data=LeRobotRoboTwinMultiTaskDataConfig(
+            repo_id="pi05_robotwin_4task",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="pi05_robotwin_4task"),
+            adapt_to_pi=True,
+            use_delta_joint_actions=True,
+            action_sequence_keys=("action",),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=200_000,
+    ),
+    TrainConfig(
         name="pi0_behavior",
         model=pi0_config.Pi0Config(),
         data=LeRobotBehaviorDataConfig(
@@ -615,6 +638,40 @@ def _override_with_data_kwargs(config: TrainConfig, data_kwargs) -> TrainConfig:
     return config
 
 
+def _local_lerobot_spec_from_path(data_path: str):
+    """Build a single local LeRobot spec for RoboTwin-style parquet datasets."""
+    from openpi.training.robotwin_tasks import LeRobotLocalDatasetSpec
+
+    local_root = resolve_lerobot_dataset_root(data_path)
+    if not (local_root / "meta" / "info.json").is_file():
+        return None
+
+    spec_repo_id = f"{local_root.parent.name}_{local_root.name}"
+    return LeRobotLocalDatasetSpec(
+        repo_id=spec_repo_id,
+        root=str(local_root),
+        weight=1.0,
+    )
+
+
+class _LocalLeRobotDataConfigFactory:
+    """Wrap a DataConfigFactory to inject a local RoboTwin dataset spec after create()."""
+
+    def __init__(self, inner, local_spec):
+        self._inner = inner
+        self._local_spec = local_spec
+
+    def create(self, assets_dirs: pathlib.Path, model_config):
+        data_config = self._inner.create(assets_dirs, model_config)
+        return dataclasses.replace(
+            data_config,
+            lerobot_local_datasets=(self._local_spec,),
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def get_openpi_config(
     config_name: str,
     model_path: Optional[str] = None,
@@ -660,5 +717,12 @@ def get_openpi_config(
             assets = dataclasses.replace(assets, asset_id=original_repo_id)
         new_data = dataclasses.replace(config.data, repo_id=repo_id, assets=assets)
         config = dataclasses.replace(config, data=new_data)
+        local_spec = _local_lerobot_spec_from_path(repo_id)
+        if local_spec is not None:
+            # RoboTwin parquet embeds legacy HF "List" metadata; use the pandas loader.
+            config = dataclasses.replace(
+                config,
+                data=_LocalLeRobotDataConfigFactory(config.data, local_spec),
+            )
 
     return config

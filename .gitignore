@@ -11,6 +11,8 @@ __pycache__
 build
 docs/build
 dist
+data/
+logs
 logs/*
 logs_baseline/*
 outputs/*
@@ -21,4 +23,5 @@ uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
-.claude/settings.json
+.claude/*
+.cursor/*

@@ -1,0 +1,98 @@
+env_type: robotwin
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+
+reward_coef: 1.0
+use_custom_reward: True
+use_rel_reward: True
+center_crop: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 1500
+max_episode_steps: 1500 # max episode steps for truncation
+
+is_eval: False
+
+assets_path: "/path/to/robotwin_assets"
+seeds_path: null
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+# [Stage-A stability] Process-level watchdog for SAPIEN/mplib native hangs (GIL held).
+# Only active when env.train.env_type=robotwin (see robotwin_hang_diagnostics.py).
+# Normal chunk_step ~2-3s; 60s should never trip healthy runs. Set 0 to disable watchdog.
+# Set enable_hang_diagnostics: false to disable PROGRESS/HEARTBEAT logs on robotwin too.
+enable_hang_diagnostics: true
+# Throttle hang-diagnosis logging (see rlinf/utils/logging.py):
+# - set_progress_state no longer prints every chunk by default
+# - HEARTBEAT every N seconds (rank 0 always; other ranks when stuck)
+hang_diagnostics_heartbeat_interval_sec: 60
+hang_diagnostics_heartbeat_stuck_threshold_sec: 45
+# Log chunk progress every N chunks (plus first/last chunk per epoch)
+hang_diagnostics_chunk_log_interval: 8
+# Set true to print throttled chunk milestones from every Env/Rollout rank
+hang_diagnostics_milestone_all_ranks: false
+
+# [Stage-B stability] Subprocess isolation per SubEnv; timeout kills single sub-process.
+use_subproc_env: true
+subproc_step_timeout_sec: 60.0
+subproc_max_respawns: 999999
+on_subenv_timeout: truncate   # truncate | fail
+chunk_step_timeout_sec: 0       # subproc mode: disable process-level watchdog
+
+task_config:
+  task_name: open_microwave
+  step_lim: 1500
+  # [Stage-A stability] Keep mplib: RL training path gen_sparse_reward_data() in
+  # RoboTwin/envs/_base_task.py hard-codes left/right_mplib_planner.TOPP().
+  # Changing planner_backend to curobo alone does NOT affect training chunk_step.
+  planner_backend: mplib # Choices: ["curobo", "mplib"]
+  # if you want to modify the config, please check the following tutorial first:
+  # https://robotwin-platform.github.io/doc/usage/configurations.html
+  render_freq: 0
+  episode_num: 100
+  use_seed: false
+  save_freq: 15
+  embodiment: [aloha-agilex]
+  language_num: 100
+  domain_randomization:
+    random_background: false
+    cluttered_table: false
+    clean_background_rate: 1
+    random_head_camera_dis: 0
+    random_table_height: 0
+    random_light: false
+    crazy_random_light_rate: 0
+  camera:
+    head_camera_type: D435
+    wrist_camera_type: D435
+    collect_head_camera: true
+    # Do NOT disable wrist camera: pi0.5 expects 3 images (head + 2 wrist).
+    collect_wrist_camera: true
+  data_type:
+    rgb: true
+    third_view: false
+    depth: false
+    pointcloud: false
+    observer: false
+    endpose: true
+    qpos: true
+    mesh_segmentation: false
+    actor_segmentation: false
+  pcd_down_sample_num: 1024
+  pcd_crop: true
+  save_path: ./data
+  # [Stage-A stability] Reduce sapien_clear_cache() frequency during reset;
+  # was 5, raised to 12 to avoid cache clears interleaving with parallel chunk_step.
+  clear_cache_freq: 12
+  collect_data: true
+  eval_video_log: true

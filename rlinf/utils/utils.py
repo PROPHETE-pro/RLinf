@@ -816,3 +816,26 @@ def preprocess_embodied_batch(
             batch["loss_mask"] = reward_filter_mask
 
     return batch
+
+
+def filter_critic_keys_from_state_dict(
+    state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop value/critic head weights so a randomly initialized critic is kept."""
+    return {k: v for k, v in state_dict.items() if "value_head" not in k}
+
+
+def load_runner_ckpt_state_dict(
+    ckpt_path: str,
+    keep_critic_weight: bool = False,
+) -> dict[str, Any]:
+    """Load ``runner.ckpt_path`` weights, optionally dropping critic params.
+
+    When ``keep_critic_weight`` is False (default), keys containing
+    ``value_head`` are removed so the model's randomly initialized critic
+    is retained after ``load_state_dict(..., strict=False)``.
+    """
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    if not keep_critic_weight:
+        state_dict = filter_critic_keys_from_state_dict(state_dict)
+    return state_dict

@@ -53,6 +53,14 @@ def main(cfg) -> None:
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncEmbodiedSACFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_lwd":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.async_fsdp_lwd_policy_worker import (
+            AsyncEmbodiedLWDFSDPPolicy,
+        )
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncEmbodiedLWDFSDPPolicy
     elif cfg.algorithm.loss_type == "rlt_ac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import AsyncRLTACFSDPPolicy

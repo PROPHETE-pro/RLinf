@@ -709,6 +709,69 @@ class TrajectoryReplayBuffer:
 
         return batch if batch is not None else {}
 
+    @staticmethod
+    def _flatten_action_samples(actions: torch.Tensor) -> torch.Tensor:
+        """Normalize action rows to [N, flat_dim] for mixed replay/demo sampling.
+
+        Online rollouts store actions as [T, B, H*D] while LeRobot demo conversion
+        may store [T, B, H, D]. Both must flatten to the same rank before
+        ``concat_batch`` merges replay and demo samples.
+        """
+        if actions.dim() == 3:
+            return actions.reshape(actions.shape[0], -1)
+        return actions
+
+    @staticmethod
+    def _flatten_trajectory_tensor(tensor: torch.Tensor, field: str, traj_len: int) -> torch.Tensor:
+        """Flatten [T, B, ...] trajectory tensors to [T*B, ...] sample rows."""
+        if field in ["dones", "terminations", "truncations"]:
+            extra = int(tensor.shape[0] - traj_len)
+            if extra > 0:
+                assert traj_len % extra == 0, (
+                    f"Trajectory length {traj_len} is not divisible by extra {extra} for field {field}"
+                )
+                epoch_len = traj_len // extra
+                tensor = tensor.reshape(extra, epoch_len + 1, *tensor.shape[1:])[:, 1:]
+                tensor = tensor.reshape(traj_len, *tensor.shape[2:])
+
+        if tensor.dim() == 2 and field in {"versions", "prev_values"}:
+            # Demo buffers use [T, 1] for scalar metadata; online uses [T, B, 1].
+            return tensor.reshape(-1, 1)
+
+        flat = tensor.reshape(-1, *tensor.shape[2:])
+        if field == "actions":
+            flat = TrajectoryReplayBuffer._flatten_action_samples(flat)
+        elif field in {"versions", "prev_values"} and flat.dim() == 2 and flat.shape[1] > 1:
+            flat = flat[:, :1]
+        return flat
+
+    @staticmethod
+    def _align_action_aligned_fields(flat: dict) -> None:
+        """Match chunk-level demo fields to online flattened action width.
+
+        Online ``intervene_flags`` follow ``zeros_like(actions)`` with width H*D,
+        while legacy demo buffers store chunk-level flags with width H only.
+        """
+        actions = flat.get("actions")
+        if not isinstance(actions, torch.Tensor) or actions.dim() != 2:
+            return
+
+        action_width = actions.shape[1]
+        for field in ("intervene_flags",):
+            tensor = flat.get(field)
+            if not isinstance(tensor, torch.Tensor) or tensor.dim() != 2:
+                continue
+            if tensor.shape[0] != actions.shape[0] or tensor.shape[1] == action_width:
+                continue
+            if action_width % tensor.shape[1] != 0:
+                continue
+            repeat = action_width // tensor.shape[1]
+            flat[field] = (
+                tensor.unsqueeze(-1)
+                .expand(-1, -1, repeat)
+                .reshape(tensor.shape[0], -1)
+            )
+
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
         flat: dict[str, object] = {}
         tensor_fields = trajectory.__dataclass_fields__.keys()
@@ -717,18 +780,7 @@ class TrajectoryReplayBuffer:
         for field in tensor_fields:
             tensor = getattr(trajectory, field)
             if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                if field in ["dones", "terminations", "truncations"]:
-                    extra = int(tensor.shape[0] - traj_len)
-                    if extra > 0:
-                        assert traj_len % extra == 0, (
-                            f"Trajectory length {traj_len} is not divisible by extra {extra} for field {field}"
-                        )
-                        epoch_len = traj_len // extra
-                        tensor = tensor.reshape(
-                            extra, epoch_len + 1, *tensor.shape[1:]
-                        )[:, 1:]
-                        tensor = tensor.reshape(traj_len, *tensor.shape[2:])
-                flat[field] = tensor.reshape(-1, *tensor.shape[2:])
+                flat[field] = self._flatten_trajectory_tensor(tensor, field, traj_len)
 
         if trajectory.curr_obs:
             flat["curr_obs"] = {}
@@ -748,6 +800,7 @@ class TrajectoryReplayBuffer:
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
 
+        self._align_action_aligned_fields(flat)
         return flat
 
     def _extract_chunk_from_flat_trajectory(

@@ -85,6 +85,19 @@ class OpenPi0Config(Pi0Config):
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
 
+    # ===== LWD / DIVL+QAM parameters =====
+    use_lwd: bool = False  # Enable LWD (DIVL value/critic + QAM flow policy)
+    lwd_state_dim: int = 14  # RoboTwin proprio dim
+    lwd_num_q_heads: int = 2  # Double Q
+    lwd_num_atoms: int = 51  # Categorical V atoms
+    lwd_v_min: float = 0.0
+    lwd_v_max: float = 1.0
+    lwd_image_latent_dim: int = 64
+    lwd_state_latent_dim: int = 64
+    lwd_action_latent_dim: int = 64
+    lwd_hidden_dims: tuple = field(default_factory=lambda: (128, 128, 128))
+    lwd_agg_q: str = "min"
+
     # ===== NFT-specific parameters =====
     is_nft: bool = False
 
@@ -272,6 +285,62 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 output_dim=1,
             ).to(dtype=_dsrl_dtype)
 
+        # ===== LWD (DIVL+QAM) components: chunk-level Q + categorical V =====
+        if self.config.use_lwd:
+            from rlinf.models.embodiment.modules.compact_encoders import (
+                CompactMultiQHead,
+                CompactStateEncoder,
+                LightweightImageEncoder64,
+            )
+
+            _lwd_dtype = torch.bfloat16
+            self.lwd_critic_image_encoder = LightweightImageEncoder64(
+                num_images=1,
+                latent_dim=self.config.lwd_image_latent_dim,
+                image_size=64,
+            ).to(dtype=_lwd_dtype)
+            self.lwd_critic_state_encoder = CompactStateEncoder(
+                state_dim=self.config.lwd_state_dim,
+                hidden_dim=self.config.lwd_state_latent_dim,
+            ).to(dtype=_lwd_dtype)
+            self.lwd_value_image_encoder = LightweightImageEncoder64(
+                num_images=1,
+                latent_dim=self.config.lwd_image_latent_dim,
+                image_size=64,
+            ).to(dtype=_lwd_dtype)
+            self.lwd_value_state_encoder = CompactStateEncoder(
+                state_dim=self.config.lwd_state_dim,
+                hidden_dim=self.config.lwd_state_latent_dim,
+            ).to(dtype=_lwd_dtype)
+            # Pool action chunk -> latent, then CompactMultiQHead over (s, img, a_pool)
+            self.lwd_action_pool = torch.nn.Sequential(
+                torch.nn.Linear(
+                    self.config.action_dim, self.config.lwd_action_latent_dim
+                ),
+                torch.nn.ReLU(),
+                torch.nn.Linear(
+                    self.config.lwd_action_latent_dim, self.config.lwd_action_latent_dim
+                ),
+            ).to(dtype=_lwd_dtype)
+            self.lwd_q_head = CompactMultiQHead(
+                state_dim=self.config.lwd_state_latent_dim,
+                image_dim=self.config.lwd_image_latent_dim,
+                action_dim=self.config.lwd_action_latent_dim,
+                hidden_dims=self.config.lwd_hidden_dims,
+                num_q_heads=self.config.lwd_num_q_heads,
+                output_dim=1,
+            ).to(dtype=_lwd_dtype)
+            v_in = (
+                self.config.lwd_state_latent_dim + self.config.lwd_image_latent_dim
+            )
+            self.lwd_v_head = ValueHead(
+                input_dim=v_in,
+                hidden_sizes=tuple(self.config.lwd_hidden_dims),
+                output_dim=self.config.lwd_num_atoms,
+                activation="relu",
+                bias_last=True,
+            ).to(dtype=_lwd_dtype)
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
@@ -362,6 +431,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.DIVL_VALUE:
+            return self.divl_value_forward(**kwargs)
+        elif forward_type == ForwardType.DIVL_CRITIC:
+            return self.divl_critic_forward(**kwargs)
+        elif forward_type == ForwardType.QAM_POLICY:
+            return self.qam_policy_forward(**kwargs)
         else:
             raise NotImplementedError
 
@@ -391,13 +466,23 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             actions = actions.to(device=device)
         actions = actions.to(dtype=torch.float32)
 
-        # PI0Pytorch.forward returns per-element MSE (reduction="none").
-        if self.config.use_rlt:
-            loss, prefix_output, prefix_mask = self._sft_forward_with_rlt_prefix(
-                observation, actions
-            )
-        else:
-            loss = super().forward(observation, actions)
+        # Run SFT in eval mode so gemma_pytorch does not force-enable gradient
+        # checkpointing (incompatible with multiple forwards per micro-batch).
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.enable_grad():
+                # PI0Pytorch.forward returns per-element MSE (reduction="none").
+                if self.config.use_rlt:
+                    loss, prefix_output, prefix_mask = (
+                        self._sft_forward_with_rlt_prefix(observation, actions)
+                    )
+                else:
+                    loss = super().forward(observation, actions)
+        finally:
+            if was_training:
+                self.train()
+
         if use_action_chunk_loss:
             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
         vla_loss = loss.mean()
@@ -803,10 +888,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
             processed_obs["observation/state"] = env_states
-        if env_obs["wrist_images"] is not None:
-            processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
-        if env_obs["extra_view_images"] is not None:
-            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+        wrist_images = env_obs.get("wrist_images")
+        if wrist_images is not None:
+            processed_obs["observation/wrist_image"] = wrist_images
+        extra_view_images = env_obs.get("extra_view_images")
+        if extra_view_images is not None:
+            processed_obs["observation/extra_view_image"] = extra_view_images
         return processed_obs
 
     def precision_processor(self, processed_obs):
@@ -1417,6 +1504,274 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     self.logger.info(
                         f"  Froze {noise_net_params:,} parameters in reinflow_explore_noise_net"
                     )
+
+    # ===== LWD / DIVL+QAM methods =====
+
+    def _lwd_obs_to_features(self, obs, *, train: bool = False, for_value: bool = False):
+        """Encode env obs into (state_feat, image_feat) for LWD V/Q heads."""
+        if not self.config.use_lwd:
+            raise ValueError("LWD forward called but use_lwd=False")
+        if "images" not in obs:
+            if "main_images" in obs:
+                obs = {"images": [obs["main_images"]], "states": obs["states"]}
+            else:
+                raise ValueError(
+                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images'."
+                )
+        images = self._preprocess_dsrl_images(obs["images"], train=train)
+        states = self._preprocess_states(obs["states"])
+        if for_value:
+            img_enc = self.lwd_value_image_encoder
+            state_enc = self.lwd_value_state_encoder
+        else:
+            img_enc = self.lwd_critic_image_encoder
+            state_enc = self.lwd_critic_state_encoder
+        device = states.device
+        images = images.to(device=device, dtype=torch.bfloat16)
+        states = states.to(device=device, dtype=torch.bfloat16)
+        # Pad / truncate state dim to configured lwd_state_dim
+        state_dim = self.config.lwd_state_dim
+        if states.shape[-1] < state_dim:
+            pad = torch.zeros(
+                states.shape[0],
+                state_dim - states.shape[-1],
+                device=states.device,
+                dtype=states.dtype,
+            )
+            states = torch.cat([states, pad], dim=-1)
+        elif states.shape[-1] > state_dim:
+            states = states[..., :state_dim]
+        image_features = img_enc(images)
+        state_features = state_enc(states)
+        return state_features, image_features
+
+    def _flow_env_action_shape(self) -> tuple[int, int]:
+        """Env-side chunk layout (distinct from OpenPI padded ``action_dim``)."""
+        env_dim = int(getattr(self.config, "action_env_dim", self.config.action_dim))
+        horizon = int(getattr(self.config, "action_chunk", self.config.action_horizon))
+        return horizon, env_dim
+
+    def _lwd_weight_dtype(
+        self, module: torch.nn.Module, fallback: torch.dtype = torch.bfloat16
+    ) -> torch.dtype:
+        try:
+            return next(module.parameters()).dtype
+        except StopIteration:
+            return fallback
+
+    def _reshape_actions_for_flow(self, actions: torch.Tensor) -> torch.Tensor:
+        """Restore ``[B, H, D_env]`` from replay-buffer flat ``[B, H*D_env]``."""
+        full_horizon, env_dim = self._flow_env_action_shape()
+        if actions.dim() == 3:
+            return actions
+        if actions.dim() == 2:
+            width = int(actions.shape[1])
+            if width == full_horizon * env_dim:
+                return actions.reshape(actions.shape[0], full_horizon, env_dim)
+            if width == env_dim:
+                return actions.unsqueeze(1)
+            if width > env_dim and width % env_dim == 0:
+                return actions.reshape(actions.shape[0], width // env_dim, env_dim)
+            return actions.unsqueeze(1)
+        raise ValueError(f"Unexpected actions shape {actions.shape}")
+
+    def _pool_action_chunk(self, actions: torch.Tensor) -> torch.Tensor:
+        """Mean-pool action chunk then project. actions [B,H,D] or [B,D]."""
+        actions = self._reshape_actions_for_flow(actions)
+        if actions.dim() == 2:
+            pooled = actions
+        elif actions.dim() == 3:
+            pooled = actions.mean(dim=1)
+        else:
+            raise ValueError(f"Unexpected actions shape {actions.shape}")
+        pooled = pooled.to(dtype=self._lwd_weight_dtype(self.lwd_action_pool))
+        # Match env action dim before optional pad to model action_dim.
+        env_dim = int(getattr(self.config, "action_env_dim", self.config.action_dim))
+        if pooled.shape[-1] < env_dim:
+            pad = torch.zeros(
+                pooled.shape[0],
+                env_dim - pooled.shape[-1],
+                device=pooled.device,
+                dtype=pooled.dtype,
+            )
+            pooled = torch.cat([pooled, pad], dim=-1)
+        elif pooled.shape[-1] > env_dim:
+            pooled = pooled[..., :env_dim]
+        model_dim = int(self.config.action_dim)
+        if pooled.shape[-1] < model_dim:
+            pad = torch.zeros(
+                pooled.shape[0],
+                model_dim - pooled.shape[-1],
+                device=pooled.device,
+                dtype=pooled.dtype,
+            )
+            pooled = torch.cat([pooled, pad], dim=-1)
+        elif pooled.shape[-1] > model_dim:
+            pooled = pooled[..., :model_dim]
+        return self.lwd_action_pool(pooled)
+
+    def divl_value_forward(self, obs=None, data=None, train=False, **kwargs):
+        """Categorical V logits [B, num_atoms]."""
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        state_features, image_features = self._lwd_obs_to_features(
+            obs, train=train, for_value=True
+        )
+        if kwargs.get("detach_encoder", False):
+            state_features = state_features.detach()
+            image_features = image_features.detach()
+        feats = torch.cat([state_features, image_features], dim=-1)
+        feats = feats.to(dtype=self._lwd_weight_dtype(self.lwd_v_head))
+        return self.lwd_v_head(feats)
+
+    def divl_critic_forward(
+        self,
+        obs=None,
+        data=None,
+        actions=None,
+        detach_encoder=False,
+        train=False,
+        **kwargs,
+    ):
+        """Chunk-level multi-head Q [B, num_q_heads]."""
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        if actions is None:
+            actions = kwargs.get("actions")
+        state_features, image_features = self._lwd_obs_to_features(
+            obs, train=train, for_value=False
+        )
+        if detach_encoder:
+            state_features = state_features.detach()
+            image_features = image_features.detach()
+        device = state_features.device
+        actions = actions.to(device=device)
+        action_features = self._pool_action_chunk(actions)
+        return self.lwd_q_head(state_features, image_features, action_features)
+
+    def qam_policy_forward(
+        self,
+        obs=None,
+        actions=None,
+        noise=None,
+        time=None,
+        freeze_backbone: bool = True,
+        **kwargs,
+    ):
+        """Predict flow velocity u_θ(x_t, t) for QAM.
+
+        Returns dict with u_pred, x_t, time, noise (and optionally observation
+        intermediates). Uses action expert; VLM backbone can be frozen.
+        """
+        if actions is None:
+            raise ValueError("qam_policy_forward requires actions")
+        if obs is None:
+            obs = kwargs.get("obs", {})
+
+        # Build OpenPI observation from env obs when needed.
+        if "observation/state" in obs or "observation/image" in obs:
+            forward_inputs = obs
+        else:
+            # Avoid KeyError on optional keys missing from RoboTwin obs.
+            safe_obs = {
+                "main_images": obs["main_images"],
+                "states": obs["states"],
+                "task_descriptions": obs.get(
+                    "task_descriptions", obs.get("prompt", [" "] * len(obs["states"]))
+                ),
+                "wrist_images": obs.get("wrist_images"),
+                "extra_view_images": obs.get("extra_view_images"),
+            }
+            to_process = self.obs_processor(safe_obs)
+            forward_inputs = self.input_transform(to_process, transpose=False)
+
+        observation = _model.Observation.from_dict(forward_inputs)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        device = next(self.parameters()).device
+        images = [img.to(device) for img in images]
+        img_masks = [m.to(device) for m in img_masks]
+        if lang_tokens is not None:
+            lang_tokens = lang_tokens.to(device)
+        if lang_masks is not None:
+            lang_masks = lang_masks.to(device)
+        state = state.to(device)
+        actions = actions.to(device=device, dtype=torch.float32)
+        actions = self._reshape_actions_for_flow(actions)
+
+        act_dim = int(self.config.action_dim)
+        if actions.shape[-1] < act_dim:
+            pad_d = torch.zeros(
+                actions.shape[0],
+                actions.shape[1],
+                act_dim - actions.shape[-1],
+                device=actions.device,
+                dtype=actions.dtype,
+            )
+            actions = torch.cat([actions, pad_d], dim=-1)
+        elif actions.shape[-1] > act_dim:
+            actions = actions[..., :act_dim]
+
+        full_horizon = int(self.config.action_horizon)
+        if actions.shape[1] > full_horizon:
+            actions = actions[:, :full_horizon]
+
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        else:
+            noise = noise.to(device=actions.device, dtype=actions.dtype)
+            if noise.shape[1] > full_horizon:
+                noise = noise[:, :full_horizon]
+            if noise.shape[-1] < act_dim:
+                pad_n = torch.zeros(
+                    noise.shape[0],
+                    noise.shape[1],
+                    act_dim - noise.shape[-1],
+                    device=noise.device,
+                    dtype=noise.dtype,
+                )
+                noise = torch.cat([noise, pad_n], dim=-1)
+            elif noise.shape[-1] > act_dim:
+                noise = noise[..., :act_dim]
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+        else:
+            time = time.to(device=actions.device, dtype=actions.dtype)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1.0 - time_expanded) * actions
+
+        backbone_ctx = torch.no_grad() if freeze_backbone else torch.enable_grad()
+        with backbone_ctx:
+            _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            if freeze_backbone:
+                # Detach KV so grads only flow into action expert / out proj.
+                past_key_values = tree_map(
+                    lambda x: x.detach() if torch.is_tensor(x) else x,
+                    past_key_values,
+                )
+                prefix_pad_masks = prefix_pad_masks.detach()
+                state_for_vel = state.detach()
+            else:
+                state_for_vel = state
+
+        v_t, _ = self.get_velocity(
+            state_for_vel, x_t, time, prefix_pad_masks, past_key_values
+        )
+        env_dim = int(getattr(self.config, "action_env_dim", act_dim))
+        out_dim = min(env_dim, act_dim, v_t.shape[-1])
+        v_t = v_t[:, :, :out_dim]
+        return {
+            "u_pred": v_t,
+            "x_t": x_t[:, :, :out_dim],
+            "time": time,
+            "noise": noise[:, :, :out_dim],
+            "actions": actions[:, :, :out_dim],
+        }
 
     # ===== DSRL-specific methods =====
 

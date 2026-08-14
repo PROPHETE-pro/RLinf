@@ -1,0 +1,91 @@
+env_type: robotwin
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+
+reward_coef: 1.0
+# LWD: sparse success reward only (no dense shaping).
+use_dense_reward: False
+use_custom_reward: True
+use_rel_reward: False
+center_crop: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+# Unified horizon across 4-task suite (max of the four).
+max_steps_per_rollout_epoch: 1600
+max_episode_steps: 1600
+
+is_eval: False
+
+assets_path: "/path/to/robotwin_assets"
+seeds_path: null
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+enable_hang_diagnostics: true
+hang_diagnostics_heartbeat_interval_sec: 60
+hang_diagnostics_heartbeat_stuck_threshold_sec: 45
+hang_diagnostics_chunk_log_interval: 8
+hang_diagnostics_milestone_all_ranks: false
+
+use_subproc_env: true
+subproc_step_timeout_sec: 60.0
+subproc_max_respawns: 999999
+on_subenv_timeout: truncate
+chunk_step_timeout_sec: 0
+
+# Override in experiment yaml for N=1 or N=4.
+task_names:
+  - open_microwave
+  - hanging_mug
+  - place_mouse_pad
+  - blocks_ranking_size
+
+task_config:
+  # Placeholder; per-env task_name comes from task_names[env_id % N].
+  task_name: open_microwave
+  step_lim: 1600
+  planner_backend: mplib
+  render_freq: 0
+  episode_num: 100
+  use_seed: false
+  save_freq: 15
+  embodiment: [aloha-agilex]
+  language_num: 100
+  domain_randomization:
+    random_background: false
+    cluttered_table: false
+    clean_background_rate: 1
+    random_head_camera_dis: 0
+    random_table_height: 0
+    random_light: false
+    crazy_random_light_rate: 0
+  camera:
+    head_camera_type: D435
+    wrist_camera_type: D435
+    collect_head_camera: true
+    collect_wrist_camera: true
+  data_type:
+    rgb: true
+    third_view: false
+    depth: false
+    pointcloud: false
+    observer: false
+    endpose: true
+    qpos: true
+    mesh_segmentation: false
+    actor_segmentation: false
+  pcd_down_sample_num: 1024
+  pcd_crop: true
+  save_path: ./data
+  clear_cache_freq: 12
+  collect_data: true
+  eval_video_log: false

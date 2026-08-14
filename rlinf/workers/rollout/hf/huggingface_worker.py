@@ -36,6 +36,9 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.logging import log_progress, set_progress_state, start_progress_heartbeat, _cuda_mem_summary
+from rlinf.utils.robotwin_hang_diagnostics import configure_from_cfg
+from rlinf.utils.utils import load_runner_ckpt_state_dict
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -44,6 +47,7 @@ class MultiStepRolloutWorker(Worker):
         Worker.__init__(self)
 
         self.cfg = cfg
+        configure_from_cfg(self.cfg)
         self.should_stop = False
 
         self.only_eval = cfg.runner.get("only_eval", False)
@@ -145,8 +149,15 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            keep_critic_weight = bool(
+                self.cfg.runner.get("keep_critic_weight", False)
+            )
+            model_dict = load_runner_ckpt_state_dict(
+                self.cfg.runner.ckpt_path,
+                keep_critic_weight=keep_critic_weight,
+            )
+            # strict=False when critic keys are dropped so random value_head remains.
+            self.hf_model.load_state_dict(model_dict, strict=keep_critic_weight)
 
         rlt_feature_model_config = OmegaConf.select(
             self.cfg, "rollout.rlt_feature_model", default=None
@@ -510,20 +521,58 @@ class MultiStepRolloutWorker(Worker):
         else:
             use_expert = False
 
+        import time as _time
+
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            if use_expert:
-                actions, result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
+            _t0 = _time.time()
+            set_progress_state(
+                "Rollout",
+                "predict: before predict_action_batch",
+                rank=self._rank,
+                extra=_cuda_mem_summary(),
+                all_ranks=True,
+            )
+            try:
+                if use_expert:
+                    actions, result = self.expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
+                    expert_label_flag = True
+                else:
+                    actions, result = self.hf_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
+            except Exception as e:
+                set_progress_state(
+                    "Rollout",
+                    f"predict: EXCEPTION {type(e).__name__}: {e}",
+                    rank=self._rank,
+                    extra=_cuda_mem_summary(),
+                    all_ranks=True,
                 )
-                expert_label_flag = True
-            else:
-                actions, result = self.hf_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
+                raise
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception as e:
+                set_progress_state(
+                    "Rollout",
+                    f"predict: cuda.synchronize EXCEPTION {type(e).__name__}: {e}",
+                    rank=self._rank,
+                    all_ranks=True,
                 )
+                raise
+            set_progress_state(
+                "Rollout",
+                f"predict: after predict_action_batch dt={_time.time() - _t0:.2f}s",
+                rank=self._rank,
+                extra=_cuda_mem_summary(),
+                all_ranks=True,
+            )
 
             # Decide re-label or not
             if (
@@ -621,6 +670,11 @@ class MultiStepRolloutWorker(Worker):
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} sync_model_from_actor: start",
+            rank=self._rank,
+        )
 
         async def recv_func() -> Any:
             return await self.broadcast(
@@ -648,12 +702,22 @@ class MultiStepRolloutWorker(Worker):
                 ).async_wait()
 
         if not self.weight_syncer.receiver_initialized():
+            log_progress(
+                "Rollout",
+                f"rank={self._rank} sync_model_from_actor: init_receiver",
+                rank=self._rank,
+            )
             await self.weight_syncer.init_receiver(
                 state_dict=self.hf_model.state_dict(),
                 recv=recv_func,
                 send=send_func,
             )
 
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} sync_model_from_actor: apply",
+            rank=self._rank,
+        )
         applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
         self.version = applied_version
         if self.finished_episodes is None:
@@ -665,12 +729,31 @@ class MultiStepRolloutWorker(Worker):
 
         gc.collect()
         self.torch_platform.empty_cache()
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} sync_model_from_actor: done (version={applied_version})",
+            rank=self._rank,
+        )
 
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} generate_one_epoch: start "
+            f"(n_train_chunk_steps={self.n_train_chunk_steps}, "
+            f"stages={self.num_pipeline_stages})",
+            rank=self._rank,
+        )
+        for chunk_step_idx in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
+                set_progress_state(
+                    "Rollout",
+                    f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                    f"stage={stage_id}: waiting recv obs from Env",
+                    rank=self._rank,
+                    all_ranks=True,
+                )
                 env_output = await self.recv_from(
                     group_name=self.cfg.env.group_name,
                     channel=input_channel,
@@ -681,6 +764,14 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+                set_progress_state(
+                    "Rollout",
+                    f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                    f"stage={stage_id}: calling _predict_rollout_actions",
+                    rank=self._rank,
+                    extra=_cuda_mem_summary(),
+                    all_ranks=True,
+                )
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
@@ -693,6 +784,13 @@ class MultiStepRolloutWorker(Worker):
                     result,
                     final_obs=env_output.get("final_obs", None),
                 )
+                set_progress_state(
+                    "Rollout",
+                    f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                    f"stage={stage_id}: send_to actions -> Env",
+                    rank=self._rank,
+                    all_ranks=True,
+                )
                 self.send_to(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
@@ -703,7 +801,20 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.train_batch_size,
                     split_fn=self._split_rollout_result,
                 )
+                set_progress_state(
+                    "Rollout",
+                    f"chunk {chunk_step_idx + 1}/{self.n_train_chunk_steps} "
+                    f"stage={stage_id}: send_to done",
+                    rank=self._rank,
+                    all_ranks=True,
+                )
         for stage_id in range(self.num_pipeline_stages):
+            set_progress_state(
+                "Rollout",
+                f"final bootstrap stage={stage_id}: waiting recv obs from Env",
+                rank=self._rank,
+                all_ranks=True,
+            )
             env_output = await self.recv_from(
                 group_name=self.cfg.env.group_name,
                 channel=input_channel,
@@ -743,6 +854,11 @@ class MultiStepRolloutWorker(Worker):
                 batch_size=self.train_batch_size,
                 split_fn=self._split_rollout_result,
             )
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} generate_one_epoch: done",
+            rank=self._rank,
+        )
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -750,18 +866,44 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
     ):
+        log_progress(
+            "Rollout",
+            f"rank={self._rank} generate() entered: "
+            f"rollout_epoch={self.rollout_epoch}",
+            rank=self._rank,
+        )
+        start_progress_heartbeat(component="Rollout", rank=self._rank)
+        set_progress_state(
+            "Rollout",
+            f"generate entered epochs={self.rollout_epoch}",
+            rank=self._rank,
+            log=True,
+        )
         if self.enable_offload:
             self.reload_model()
 
-        for _ in tqdm(
+        for epoch_idx in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
+            log_progress(
+                "Rollout",
+                f"rank={self._rank} generate epoch {epoch_idx + 1}/{self.rollout_epoch}: start",
+                rank=self._rank,
+            )
             await self.generate_one_epoch(input_channel, output_channel)
+            log_progress(
+                "Rollout",
+                f"rank={self._rank} generate epoch {epoch_idx + 1}/{self.rollout_epoch}: done",
+                rank=self._rank,
+            )
 
         if self.enable_offload:
             self.offload_model()
+        log_progress(
+            "Rollout", f"rank={self._rank} generate() finished", rank=self._rank
+        )
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:

@@ -123,24 +123,33 @@ def recursive_to_device(obj, device):
 
 def list_of_dict_to_dict_of_list(
     list_of_dict: list[dict[str, Any]],
+    *,
+    fill_missing: Any = None,
 ) -> dict[str, list[Any]]:
     """
     Convert a list of dictionaries to a dictionary of lists.
 
     Args:
         list_of_dict: List of dictionaries with same keys
+        fill_missing: Value used when a dict is missing a key present in others.
+            Mixed-key inputs can occur after SubprocVectorEnv timeout recovery.
 
     Returns:
         Dictionary where each key maps to a list of values
     """
     if len(list_of_dict) == 0:
         return {}
-    keys = list_of_dict[0].keys()
+    keys: list[str] = []
+    seen: set[str] = set()
+    for data in list_of_dict:
+        for key in data.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
     output = {key: [] for key in keys}
     for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+        for key in keys:
+            output[key].append(data.get(key, fill_missing))
     return output
 
 

@@ -25,7 +25,8 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
-from rlinf.utils.logging import get_logger
+from rlinf.utils.logging import get_logger, log_progress
+from rlinf.utils.robotwin_hang_diagnostics import configure_from_cfg
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
 from rlinf.utils.runner_utils import check_progress
@@ -65,6 +66,7 @@ class EmbodiedRunner:
         critic=None,
     ):
         self.cfg = cfg
+        configure_from_cfg(self.cfg)
         self.actor = actor
         self.rollout = rollout
         self.env = env
@@ -185,10 +187,31 @@ class EmbodiedRunner:
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
+        log_progress(
+            "Runner",
+            "sync_weights: start (actor -> rollout)",
+            rank=None,
+            logger=self.logger,
+        )
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         actor_handle: Handle = self.actor.sync_model_to_rollout()
+        log_progress(
+            "Runner",
+            "sync_weights: waiting actor.sync_model_to_rollout",
+            rank=None,
+            logger=self.logger,
+        )
         actor_handle.wait()
+        log_progress(
+            "Runner",
+            "sync_weights: waiting rollout.sync_model_from_actor",
+            rank=None,
+            logger=self.logger,
+        )
         rollout_handle.wait()
+        log_progress(
+            "Runner", "sync_weights: done", rank=None, logger=self.logger
+        )
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -483,6 +506,13 @@ class EmbodiedRunner:
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
+            log_progress(
+                "Runner",
+                f"===== training step {_step}/{self.max_steps} "
+                f"(global_step={self.global_step}) begin =====",
+                rank=None,
+                logger=self.logger,
+            )
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
 
@@ -498,7 +528,20 @@ class EmbodiedRunner:
                 with self.timer("sync_weights"):
                     if _step % self.weight_sync_interval == 0:
                         self.update_rollout_weights()
+                    else:
+                        log_progress(
+                            "Runner",
+                            f"sync_weights: skipped (interval={self.weight_sync_interval})",
+                            rank=None,
+                            logger=self.logger,
+                        )
                 with self.timer("generate_rollouts"):
+                    log_progress(
+                        "Runner",
+                        "generate_rollouts: launch env.interact + rollout.generate",
+                        rank=None,
+                        logger=self.logger,
+                    )
                     env_handle: Handle = self.env.interact(
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
@@ -515,20 +558,69 @@ class EmbodiedRunner:
                             input_channel=self.reward_channel,
                             output_channel=self.env_channel,
                         )
+                    log_progress(
+                        "Runner",
+                        "generate_rollouts: waiting rollout.generate",
+                        rank=None,
+                        logger=self.logger,
+                    )
+                    rollout_handle.wait()
+                    log_progress(
+                        "Runner",
+                        "generate_rollouts: waiting env.interact",
+                        rank=None,
+                        logger=self.logger,
+                    )
+                    env_handle.wait()
+                    if self.reward is not None:
+                        log_progress(
+                            "Runner",
+                            "generate_rollouts: waiting reward.compute_rewards",
+                            rank=None,
+                            logger=self.logger,
+                        )
+                        reward_handle.wait()
+                    log_progress(
+                        "Runner",
+                        "generate_rollouts: waiting actor.recv_rollout_trajectories",
+                        rank=None,
+                        logger=self.logger,
+                    )
                     self.actor.recv_rollout_trajectories(
                         input_channel=self.actor_channel
                     ).wait()
-                    rollout_handle.wait()
-                    if self.reward is not None:
-                        reward_handle.wait()
+                    log_progress(
+                        "Runner",
+                        "generate_rollouts: done",
+                        rank=None,
+                        logger=self.logger,
+                    )
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
+                    log_progress(
+                        "Runner",
+                        "cal_adv_and_returns: start",
+                        rank=None,
+                        logger=self.logger,
+                    )
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
+                    log_progress(
+                        "Runner",
+                        "cal_adv_and_returns: done",
+                        rank=None,
+                        logger=self.logger,
+                    )
 
                 # actor training.
+                log_progress(
+                    "Runner",
+                    "run_training: launch",
+                    rank=None,
+                    logger=self.logger,
+                )
                 actor_training_handle: Handle = self.actor.run_training()
                 env_bootstrap_handle: Handle | None = None
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
@@ -536,9 +628,21 @@ class EmbodiedRunner:
                         rollout_channel=self.rollout_channel
                     )
 
+                log_progress(
+                    "Runner",
+                    "run_training: waiting",
+                    rank=None,
+                    logger=self.logger,
+                )
                 actor_training_metrics = actor_training_handle.wait()
                 if env_bootstrap_handle is not None:
                     env_bootstrap_handle.wait()
+                log_progress(
+                    "Runner",
+                    "run_training: done",
+                    rank=None,
+                    logger=self.logger,
+                )
 
                 self.global_step += 1
                 eval_metrics = self._maybe_eval_and_checkpoint(_step)
@@ -546,6 +650,13 @@ class EmbodiedRunner:
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
 
+            log_progress(
+                "Runner",
+                f"===== training step {_step} finished "
+                f"(global_step={self.global_step}) =====",
+                rank=None,
+                logger=self.logger,
+            )
             self._log_step_metrics(
                 step=_step,
                 start_time=start_time,
@@ -603,6 +714,7 @@ class EmbodiedRunner:
                 )
                 with self.timer("generate_rollouts"):
                     rollout_handle.wait()
+                    env_handle.wait()
                     if self.reward is not None:
                         reward_handle.wait()
 
