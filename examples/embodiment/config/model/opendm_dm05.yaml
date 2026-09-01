@@ -1,0 +1,36 @@
+model_type: "opendm_dm05"
+
+# Model path - should be set in specific config files
+model_path: "/path/to/model/opendm_dm05"
+
+precision: null
+
+# Action and chunk settings
+num_action_chunks: 50  # OpenDM RoboTwin chunk_size
+action_dim: 14  # Environment action dimension (ALOHA dual-arm)
+
+# LoRA settings
+is_lora: False
+lora_rank: 32
+
+# Training settings
+use_proprio: True
+num_steps: 5  # Number of diffusion/denoising steps
+add_value_head: False  # Add value head for PPO
+safe_get_logprob: False  # Use simplified logprob calculation (False = full Gaussian)
+
+# OpenDM DM05 specific parameters
+opendm:
+  num_images_in_input: 3  # Head + left wrist + right wrist
+  image_prompts: ["Head", "Left wrist", "Right wrist"]
+  robot_type: "Aloha RoboTwin2"
+  add_state: True
+  action_mode: "absolute"
+  noise_level: 0.5  # Noise level for flow matching
+  action_chunk: ${..num_action_chunks}
+  num_steps: ${..num_steps}
+  train_expert_only: True  # Whether to only train action expert
+  action_env_dim: ${..action_dim}
+  noise_method: "flow_sde"  # Flow matching method
+  add_value_head: ${..add_value_head}
+  detach_critic_input: False

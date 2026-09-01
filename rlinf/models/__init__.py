@@ -76,6 +76,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_opendm_dm05(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.opendm_dm05 import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_mlp_policy(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.mlp_policy import get_model
 
@@ -179,6 +184,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.DEXBOTIC_DM0.value,
         _build_dexbotic_dm0,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.OPENDM_DM05.value,
+        _build_opendm_dm05,
         category="embodied",
         force=True,
     )
