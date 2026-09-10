@@ -1720,6 +1720,60 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics_data["sft_co_train/scaled_sft"] = scaled_sft.detach().item()
         return loss + scaled_sft if loss.requires_grad else scaled_sft
 
+    def _should_recompute_logprobs(self) -> bool:
+        return bool(self.cfg.rollout.get("recompute_logprobs", False))
+
+    def _recompute_prev_logprobs(self) -> None:
+        """Replace rollout ``prev_logprobs`` with actor logprobs in eval mode.
+
+        Embodied PPO compares actor logprobs against rollout-stored
+        ``prev_logprobs``. Rollout runs ``eval()`` while the actor default is
+        ``train()``, so dropout / train-eval plus FSDP vs HuggingFace make the
+        importance ratio explode even when the policy is frozen (critic warmup).
+        Recompute once per PPO step under ``eval()`` so old_logprobs share the
+        same code path as the actor loss.
+        """
+        n = int(self.rollout_batch["prev_logprobs"].shape[0])
+        micro_bs = int(self.cfg.actor.micro_batch_size)
+        num_chunks = max(n // micro_bs, 1)
+        assert n % num_chunks == 0, (
+            f"prev_logprobs batch {n} is not divisible by recompute chunks {num_chunks}"
+        )
+
+        original = self.rollout_batch["prev_logprobs"].detach()
+        pieces = split_dict_to_chunk(self.rollout_batch, num_chunks)
+        recomputed_chunks: list[torch.Tensor] = []
+        self.model.eval()
+        with torch.no_grad(), self.amp_context:
+            for piece in pieces:
+                piece = put_tensor_device(piece, self.device)
+                output = self.model(
+                    forward_inputs=piece["forward_inputs"],
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                )
+                recomputed_chunks.append(output["logprobs"].detach().float().cpu())
+
+        recomputed = torch.cat(recomputed_chunks, dim=0)
+        if recomputed.shape != original.shape:
+            raise RuntimeError(
+                "Recomputed logprobs shape mismatch: "
+                f"got {tuple(recomputed.shape)}, expected {tuple(original.shape)}"
+            )
+        mean_abs_delta = (recomputed - original.float().cpu()).abs().mean().item()
+        log_progress(
+            "Actor",
+            f"rank={self._rank} recomputed prev_logprobs "
+            f"mean_abs_delta={mean_abs_delta:.4f}",
+            rank=self._rank,
+        )
+        self.rollout_batch["prev_logprobs"] = recomputed.to(
+            device=original.device,
+            dtype=torch.float32,
+        )
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -1733,7 +1787,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
-        self.model.train()
+        recompute_logprobs = self._should_recompute_logprobs()
+        # Keep eval() for the whole PPO step when recomputing so dropout /
+        # BatchNorm match the old_logprobs (eval + no_grad) path. Gradients
+        # still flow; only stochastic layers change behavior.
+        if recompute_logprobs:
+            self.model.eval()
+        else:
+            self.model.train()
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
@@ -1746,6 +1807,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+
+        if recompute_logprobs:
+            self._recompute_prev_logprobs()
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347

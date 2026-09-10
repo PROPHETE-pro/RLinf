@@ -152,7 +152,9 @@ env:
 rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
-  recompute_logprobs: False
+  # Recompute old_logprobs on the actor (eval, no dropout) so PPO ratio is not
+  # inflated by rollout eval() vs actor train() / FSDP vs HuggingFace mismatch.
+  recompute_logprobs: True
   enable_offload: False
   pipeline_stage_num: 1
   model:
