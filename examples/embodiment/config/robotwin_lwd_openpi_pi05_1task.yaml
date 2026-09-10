@@ -104,7 +104,7 @@ env:
     use_dense_reward: False
     max_episode_steps: 400
     max_steps_per_rollout_epoch: 400
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: null
     # N=1 smoke: short-horizon task
     task_names:
@@ -125,7 +125,7 @@ env:
     max_episode_steps: 400
     max_steps_per_rollout_epoch: 400
     is_eval: True
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: null
     task_names:
       - place_mouse_pad
@@ -158,7 +158,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/mnt/pfs/7wsqem/grt/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_torch"
+    model_path: "/kpfs/data/ruitong_gan/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_torch"
     num_action_chunks: 50
     action_dim: 14
     num_steps: 5

@@ -441,7 +441,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
-        if hasattr(self, "gradient_checkpointing_disable"):
+        if hasattr(self, "is_gradient_checkpointing_enabled") and self.is_gradient_checkpointing_enabled():
+            self.gradient_checkpointing_disable()
+        elif hasattr(self, "gradient_checkpointing_disable") and not hasattr(
+            self, "is_gradient_checkpointing_enabled"
+        ):
             self.gradient_checkpointing_disable()
 
         if isinstance(data, tuple):

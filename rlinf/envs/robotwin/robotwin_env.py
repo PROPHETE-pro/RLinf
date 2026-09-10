@@ -118,6 +118,10 @@ class RoboTwinEnv(gym.Env):
     def _init_env(self):
         mp.set_start_method("spawn", force=True)
         os.environ["ASSETS_PATH"] = self.cfg.assets_path
+        # RoboTwin's cluttered-object loader uses cwd-relative ./assets/...;
+        # Ray EnvWorkers start in the RLinf repo, so chdir to the RoboTwin root.
+        if self.cfg.assets_path and os.path.isdir(self.cfg.assets_path):
+            os.chdir(self.cfg.assets_path)
 
         env_seeds = self.reset_state_ids.tolist()
         task_config = OmegaConf.to_container(self.cfg.task_config, resolve=True)
@@ -133,6 +137,7 @@ class RoboTwinEnv(gym.Env):
                 task_config=task_config,
                 n_envs=self.num_envs,
                 env_seeds=env_seeds,
+                instruction_type=self.cfg.get("instruction_type", "seen"),
                 step_timeout_sec=self.cfg.get("subproc_step_timeout_sec", 60.0),
                 max_respawns=self.cfg.get("subproc_max_respawns", 10),
                 on_timeout=self.cfg.get("on_subenv_timeout", "truncate"),
@@ -150,6 +155,7 @@ class RoboTwinEnv(gym.Env):
                 task_config=task_config,
                 n_envs=self.num_envs,
                 env_seeds=env_seeds,
+                instruction_type=self.cfg.get("instruction_type", "seen"),
             )
 
     @property
@@ -238,7 +244,7 @@ class RoboTwinEnv(gym.Env):
 
     def _extract_obs_image(self, raw_obs):
         batch_images = []
-        batch_wrist_images = []
+        per_env_wrists = []
         batch_states = []
         batch_instructions = []
         for obs in raw_obs:
@@ -258,16 +264,26 @@ class RoboTwinEnv(gym.Env):
                         obs["right_wrist_image"], center_crop=self.center_crop
                     )
                 )
-            if len(wrist_images) > 0:
-                batch_wrist_images.append(
-                    torch.stack([torch.from_numpy(img) for img in wrist_images])
-                )
+            per_env_wrists.append(wrist_images)
             batch_states.append(obs["state"])
             batch_instructions.append(obs["instruction"])
 
         batch_images = torch.stack([torch.from_numpy(img) for img in batch_images])
-        if len(batch_wrist_images) > 0:
-            batch_wrist_images = torch.stack(batch_wrist_images)
+        max_wrists = max((len(wrists) for wrists in per_env_wrists), default=0)
+        if max_wrists > 0:
+            ref_wrist = next(
+                (wrists[0] for wrists in per_env_wrists if wrists),
+                batch_images[0].numpy(),
+            )
+            padded_wrists = []
+            for wrists in per_env_wrists:
+                imgs = list(wrists)
+                while len(imgs) < max_wrists:
+                    imgs.append(np.zeros_like(ref_wrist))
+                padded_wrists.append(
+                    torch.stack([torch.from_numpy(np.asarray(img)) for img in imgs])
+                )
+            batch_wrist_images = torch.stack(padded_wrists)
         else:
             batch_wrist_images = None
         batch_states = torch.stack([torch.from_numpy(state) for state in batch_states])

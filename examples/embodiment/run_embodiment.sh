@@ -6,8 +6,49 @@ export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
 
 export MUJOCO_GL=${MUJOCO_GL:-"egl"}
 export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-"egl"}
-export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
-export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
+
+# Honor caller-exported trees. Do not auto-rewrite /kpfs → ~/ruitong_gan.
+export ROBOTWIN_PATH="${ROBOTWIN_PATH:-/path/to/RoboTwin}"
+export ASSETS_PATH="${ASSETS_PATH:-${ROBOTWIN_PATH}}"
+export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+echo "Using ROBOTWIN_PATH=${ROBOTWIN_PATH}"
+echo "Using ASSETS_PATH=${ASSETS_PATH}"
+echo "Using PYTHONPATH=${PYTHONPATH}"
+# CPU-quota 开发机: allow slow worker import (torch/openpi) before Ray kills them.
+export RAY_worker_register_timeout_seconds="${RAY_worker_register_timeout_seconds:-300}"
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
+export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+# Drop K8s Service env vars so Ray runtime_env stays under Linux ARG_MAX.
+# See rlinf/scheduler/cluster/node.py (filter_k8s_service_env_vars).
+if command -v python3 >/dev/null 2>&1; then
+  while IFS= read -r _k8s_env_name; do
+    [ -n "$_k8s_env_name" ] && unset "$_k8s_env_name"
+  done <<EOF
+$(python3 - <<'PY'
+import os, re
+def drop(k, v):
+    if k.startswith(("KAIC_", "KUBERNETES_")):
+        return True
+    if "_VPC_LB_" in k:
+        return True
+    if k.endswith("_SERVICE_HOST") or "_SERVICE_PORT" in k:
+        return True
+    if re.search(r"_PORT_\d+_(TCP|UDP)", k):
+        return True
+    if k.endswith("_PORT") and (v.startswith("tcp://") or v.startswith("udp://")):
+        return True
+    return False
+print("\n".join(k for k, v in os.environ.items() if drop(k, v)))
+PY
+)
+EOF
+  unset _k8s_env_name
+fi
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
 # Only required when running the behavior experiment.

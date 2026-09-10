@@ -74,7 +74,7 @@ env:
     max_episode_steps: 50
     max_steps_per_rollout_epoch: 50
     group_size: ${algorithm.group_size}
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: null
     center_crop: False
     video_cfg:
@@ -114,7 +114,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/mnt/pfs/7wsqem/grt/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_torch"
+    model_path: "/kpfs/data/ruitong_gan/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_torch"
     num_action_chunks: 50
     action_dim: 14
     add_value_head: True

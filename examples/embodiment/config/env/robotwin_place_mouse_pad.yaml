@@ -47,8 +47,9 @@ hang_diagnostics_chunk_log_interval: 8
 hang_diagnostics_milestone_all_ranks: false
 
 # [Stage-B stability] Subprocess isolation per SubEnv; timeout kills single sub-process.
+# 180s covers the first EGL/SAPIEN frame under GPU contention; steady chunk_step is ~2-3s.
 use_subproc_env: true
-subproc_step_timeout_sec: 60.0
+subproc_step_timeout_sec: 180.0
 subproc_max_respawns: 999999
 on_subenv_timeout: truncate   # truncate | fail
 chunk_step_timeout_sec: 0       # subproc mode: disable process-level watchdog

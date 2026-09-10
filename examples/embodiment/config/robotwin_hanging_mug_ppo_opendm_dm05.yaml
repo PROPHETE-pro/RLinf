@@ -80,9 +80,14 @@ env:
     max_episode_steps: 900
     max_steps_per_rollout_epoch: 900
     group_size: ${algorithm.group_size}
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: null
     center_crop: False
+    use_dense_reward: True
+    use_rel_reward: True
+    use_custom_reward: False
+    dense_shaping_coef: 0.5
+    dense_success_reward: 1.0
     video_cfg:
       save_video: True
     task_config:
@@ -103,13 +108,18 @@ env:
     total_num_envs: 64
     auto_reset: True
     ignore_terminations: True
+    use_dense_reward: True
+    use_rel_reward: True
+    use_custom_reward: False
+    dense_shaping_coef: 0.5
+    dense_success_reward: 1.0
     max_episode_steps: 900
     reward_coef: ${algorithm.reward_coef}
     max_steps_per_rollout_epoch: 1800
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     video_cfg:
       save_video: False
@@ -150,7 +160,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/path/to/model/DM05-robotwin"
+    model_path: "/kpfs/data/ruitong_gan/opendm/checkpoints/dm05_robotwin"
     precision: "bf16"
     num_action_chunks: 50
     action_dim: 14

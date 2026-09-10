@@ -26,7 +26,9 @@ from peft import (
     get_peft_model,
     set_peft_model_state_dict,
 )
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoProcessor
+
+from rlinf.utils.transformers_compat import AutoModelForVision2Seq
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel

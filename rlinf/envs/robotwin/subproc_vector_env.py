@@ -63,11 +63,16 @@ def _make_recovery_info(
 
 
 def _minimal_obs(instruction: str = "") -> dict[str, Any]:
-    """Placeholder observation when a SubEnv cannot serve get_obs after recovery."""
+    """Placeholder observation when a SubEnv cannot serve get_obs after recovery.
+
+    Wrist images must be arrays (not None) so batched env obs keep a uniform
+    batch dimension when mixed with live SubEnv observations.
+    """
+    dummy_image = np.zeros((240, 320, 3), dtype=np.uint8)
     return {
-        "full_image": np.zeros((240, 320, 3), dtype=np.uint8),
-        "left_wrist_image": None,
-        "right_wrist_image": None,
+        "full_image": dummy_image,
+        "left_wrist_image": dummy_image.copy(),
+        "right_wrist_image": dummy_image.copy(),
         "state": np.zeros(14, dtype=np.float32),
         "instruction": instruction,
     }
@@ -118,7 +123,7 @@ def build_robotwin_task_args(
     rdt_step = 10
     args = dict(task_config)
 
-    args["planner_backend"] = args.get("planner_backend", "curobo")
+    args["planner_backend"] = args.get("planner_backend", "mplib")
     args["clear_cache_freq"] = max(1, int(args.get("clear_cache_freq", 8)))
 
     embodiment_type = args.get("embodiment")
@@ -192,9 +197,17 @@ def _subproc_worker(
     instruction_type: str,
 ) -> None:
     """Child process entry: one RoboTwin SubEnv + Pipe command loop."""
+    def _child_log(msg):
+        if os.getenv("ROBOTWIN_SAPIEN_DEBUG", "0") not in ("1", "true", "True", "yes"):
+            return
+        print(f"[Subproc pid={os.getpid()} env={env_id} {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    _child_log(f"child start task={task_name} seed={env_seed} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    _child_log("import SubEnv")
     from robotwin.envs.vector_env import SubEnv
 
     global_lock = threading.Lock()
+    _child_log("construct SubEnv")
     sub_env = SubEnv(
         env_id=env_id,
         task_name=task_name,
@@ -203,7 +216,9 @@ def _subproc_worker(
         instruction_type=instruction_type,
         global_lock=global_lock,
     )
+    _child_log("setup_task()")
     sub_env.setup_task()
+    _child_log("ready")
     conn.send({"status": "ready"})
 
     try:
@@ -263,6 +278,7 @@ class SubprocSubEnvWorker:
         self.process = None
         self.parent_conn: Optional[connection.Connection] = None
         self._last_obs: Optional[dict[str, Any]] = None
+        self._obs_pipeline_warmed = False
         self._spawn_process(self.env_seed)
 
     def _spawn_process(self, env_seed: int) -> None:
@@ -285,6 +301,7 @@ class SubprocSubEnvWorker:
         self.process = process
         self.parent_conn = parent_conn
         self.env_seed = env_seed
+        self._obs_pipeline_warmed = False
         self._wait_ready()
 
     def _wait_ready(self, timeout: float = _SPAWN_READY_TIMEOUT_SEC) -> None:
@@ -370,6 +387,7 @@ class SubprocSubEnvWorker:
     def _remember_obs(self, obs: Optional[dict[str, Any]]) -> None:
         if isinstance(obs, dict):
             self._last_obs = obs
+            self._obs_pipeline_warmed = True
 
     def _obs_for_recovery(self) -> dict[str, Any]:
         if self._last_obs is not None:
@@ -448,7 +466,7 @@ class SubprocSubEnvWorker:
         start = time.time()
         try:
             self._send_recv("reset", env_seed, timeout=self.step_timeout_sec)
-        except TimeoutError:
+        except (TimeoutError, EOFError, BrokenPipeError, ConnectionResetError):
             elapsed = time.time() - start
             if self.on_timeout == "fail":
                 self._kill_process()
@@ -656,6 +674,23 @@ class SubprocVectorEnv(gym.Env):
     def get_obs(self) -> list[dict]:
         if len(self.workers) == 0:
             self._init_workers()
+
+        # First EGL/SAPIEN frame per SubEnv is far slower than a steady render.
+        # Fan-out to all workers at once (x4 ranks = 32 concurrent first frames)
+        # plus a large VLM on the same GPUs trips the step timeout and then
+        # kill+respawn, which repeats the cold-start cost. Serialize until every
+        # SubEnv has produced one observation; later calls stay parallel.
+        cold_ids = [
+            w.env_id for w in self.workers if not w._obs_pipeline_warmed
+        ]
+        if cold_ids:
+            logger.info(
+                "[SUBENV] staggering first get_obs for cold SubEnvs %s "
+                "(timeout=%.1fs)",
+                cold_ids,
+                self.step_timeout_sec,
+            )
+            return [worker.get_obs() for worker in self.workers]
 
         for worker in self.workers:
             worker.parent_conn.send(("get_obs", None))

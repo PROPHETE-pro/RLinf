@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import os
+import re
 import sys
 import warnings
 from dataclasses import asdict, dataclass, field
-from typing import ClassVar, Optional
+from typing import ClassVar, Mapping, Optional
 
 import ray
 import ray.actor
@@ -31,6 +32,33 @@ from ..hardware import (
     HardwareResource,
 )
 from .config import ClusterConfig, NodeGroupEnvConfig
+
+# Kubernetes injects one env var per Service/Port (often thousands on a 开发机).
+# RLinf copies node env into Ray runtime_env, which setup_worker.py receives as a
+# single argv. Linux MAX_ARG_STRLEN is 128KiB; a ~300KiB JSON makes workers die
+# during execve with no logs (E2BIG).
+_K8S_NUMBERED_PORT_RE = re.compile(r"_PORT_\d+_(TCP|UDP)")
+
+
+def _is_k8s_service_env_var(key: str, value: str) -> bool:
+    if key.startswith(("KAIC_", "KUBERNETES_")):
+        return True
+    if "_VPC_LB_" in key:
+        return True
+    if key.endswith("_SERVICE_HOST") or "_SERVICE_PORT" in key:
+        return True
+    if _K8S_NUMBERED_PORT_RE.search(key):
+        return True
+    if key.endswith("_PORT") and (
+        value.startswith("tcp://") or value.startswith("udp://")
+    ):
+        return True
+    return False
+
+
+def filter_k8s_service_env_vars(env: Mapping[str, str]) -> dict[str, str]:
+    """Drop Kubernetes service-discovery variables from an environ mapping."""
+    return {k: v for k, v in env.items() if not _is_k8s_service_env_var(k, v)}
 
 
 @dataclass
@@ -400,7 +428,7 @@ class NodeProbe:
 
         # First find env vars set between ray start and RLinf initialization on the head node
         head_node_default_env_vars = self.head_node.default_env_vars
-        current_env_vars = os.environ
+        current_env_vars = filter_k8s_service_env_vars(os.environ)
         modified_env_vars = {}
         for key, value in current_env_vars.items():
             if (
@@ -558,8 +586,8 @@ class _RemoteNodeProbe:
             node_ip=node_info["NodeManagerAddress"],
             num_cpus=int(node_info["Resources"].get("CPU", 0)),
             python_interpreter_path=python_interpreter_path,
-            default_env_vars=os.environ.copy(),
-            env_vars=os.environ.copy(),
+            default_env_vars=filter_k8s_service_env_vars(os.environ),
+            env_vars=filter_k8s_service_env_vars(os.environ),
             hardware_resources=hardware_resources,
             profiler_backends=profiler_backends,
         )

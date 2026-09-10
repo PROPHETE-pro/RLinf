@@ -1,6 +1,10 @@
+# 4-GPU fix-seed + SFT co-train: freeze train env seeds every PPO step / rollout_epoch.
+# Monitor rollout env/train/success_once — if it cannot reach ~1.0 on this closed
+# set, the bottleneck is not seed diversity (see robotwin_env.use_fixed_reset_state_ids).
+# 4xA100: 8 SubEnvs/GPU → 32 train envs (capacity sweep passed init in ~4 min).
 defaults:
-  - env/robotwin_open_microwave@env.train
-  - env/robotwin_open_microwave@env.eval
+  - env/robotwin_blocks_ranking_size@env.train
+  - env/robotwin_blocks_ranking_size@env.eval
   - model/pi0_5@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -16,19 +20,16 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 0-7
-    # [Stage-A stability] Split env vs rollout onto separate GPUs to avoid
-    # SAPIEN RT simulation and OpenPI inference contending on the same device.
-    # Note: env/rollout world_size becomes 2 each (was 4 when both used 4-7).
-    env: 0-7
-    rollout: 0-7
+    actor: 0-3
+    env: 0-3
+    rollout: 0-3
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "robotwin_open_microwave_ppo_openpi_pi05_3_sequential_rollout"
+    experiment_name: "robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain_fixseed_4gpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -39,7 +40,10 @@ runner:
   save_interval: 10
 
   resume_dir: null
-  ckpt_path: null
+  # Best available RL policy ckpt (success_once~28.1% @ step 120). keep_critic_weight=False
+  # drops value_head so dense training starts with a randomly initialized critic.
+  ckpt_path: "/kpfs/data/ruitong_gan/RLinf/logs/20260730-17_39_26-robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/checkpoints/global_step_70/actor/model_state_dict/full_weights.pt"
+  keep_critic_weight: False
 
 algorithm:
   normalize_advantages: True
@@ -55,13 +59,13 @@ algorithm:
   adv_type: gae
   loss_type: actor_critic
   loss_agg_func: "token-mean"
-  kl_beta: 0.0
+  kl_beta: 0.01
   entropy_bonus: 0
   clip_ratio_high: 0.2
   clip_ratio_low: 0.2
   clip_ratio_c: 3.0
   value_clip: 0.2
-  huber_delta: 10.0
+  huber_delta: 20.0
 
   gamma: 0.99
   gae_lambda: 0.95
@@ -74,22 +78,28 @@ env:
   group_name: "EnvGroup"
   enable_offload: False
   train:
-    rollout_epoch: 8
-    # rollout_epoch: 2
-    # env world_size=2 after GPU split (env:4-5); 8 envs => 4 SubEnv/rank (was 16/4=4 before split)
-    total_num_envs: 16
+    rollout_epoch: 4
+    total_num_envs: 32
     chunk_step_timeout_sec: 60.0
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 1600
-    max_steps_per_rollout_epoch: 1600
+    max_episode_steps: 1200
+    max_steps_per_rollout_epoch: 1200
     group_size: ${algorithm.group_size}
     assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
-    seeds_path: null
+    # Fix-seed: sample reset ids once from the known-solvable pool, then never refresh.
+    seed: 0
+    use_fixed_reset_state_ids: True
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/fixseed_capacity.json
     center_crop: False
+    # Official RoboTwin has no gen_dense_reward_once; keep sparse + SFT co-train.
+    use_dense_reward: False
+    use_rel_reward: False
+    use_custom_reward: False
     video_cfg:
-      save_video: False
+      save_video: True
     task_config:
-      step_lim: 1600
+      step_lim: 1200
+      planner_backend: mplib
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
@@ -103,12 +113,14 @@ env:
         crazy_random_light_rate: 0
   eval:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 16
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 1500
+    use_dense_reward: False
+    use_custom_reward: False
+    max_episode_steps: 1200
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 3000
+    max_steps_per_rollout_epoch: 2400
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
@@ -119,6 +131,7 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/eval
     center_crop: False
     task_config:
+      planner_backend: mplib
       embodiment: [aloha-agilex]
       camera:
         collect_wrist_camera: true
@@ -145,13 +158,20 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  # 整除约束：actor ws=4 => per-rank batch=256; rollout/rank=(8/2)*4*(1600/50)=512, 512%256=0
-  global_batch_size: 1024
+  # 整除约束（world_size=4）：512 % (32*4)=0；per-rank batch=128
+  # step_lim=1200；rollout/rank = (32*4/4)*(1200/50) = 768，768 % 128 = 0
+  global_batch_size: 512
   seed: 1234
   enable_offload: False
 
+  # SFT co-training
+  enable_sft_co_train: True
+  config_name: "pi05_robotwin_4task"
+  sft_data_path: "/kpfs/data/ruitong_gan/data/RoboTwin/Clean/blocks_ranking_size"
+  sft_loss_weight: 2.0
+
   model:
-    model_path: "/kpfs/data/ruitong_gan/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_torch"
+    model_path: "/kpfs/data/ruitong_gan/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_blocks_ranking_size_torch"
     num_action_chunks: 50
     action_dim: 14
     add_value_head: True
@@ -159,19 +179,19 @@ actor:
     openpi:
       config_name: "pi05_robotwin_4task"
       num_images_in_input: 3
-      noise_level: 0.3
+      noise_level: 0.1
       max_token_len: 250
       detach_critic_input: True
 
   optim:
     lr: 5.0e-06
-    value_lr: 1.0e-04
+    value_lr: 5.0e-05
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-    critic_warmup_steps: 0
+    critic_warmup_steps: 300
 
   fsdp_config:
     strategy: "fsdp"

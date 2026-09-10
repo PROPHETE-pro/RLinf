@@ -1419,6 +1419,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if not success_mask.any():
             return None
 
+        max_sft_bs = int(self.cfg.actor.get("sft_co_train", {}).get("max_success_batch", 0) or 0)
+        if max_sft_bs > 0:
+            success_idx = success_mask.nonzero(as_tuple=False).flatten()
+            success_mask = torch.zeros_like(success_mask)
+            success_mask[success_idx[:max_sft_bs]] = True
+
         filtered: dict[str, torch.Tensor] = {}
         batch_size = success_mask.shape[0]
         for key, value in forward_inputs.items():
@@ -1591,12 +1597,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if not planned_terms:
             self._restore_policy_grad_after_sft(enabled_grad_names)
-            if self._in_sft_only_phase():
+            # Sparse-reward success SFT often has no positive chunk in a
+            # micro-batch. Skip instead of crashing the SFT-only phase.
+            if self._in_sft_only_phase() and self.sft_offline_ratio > 0:
                 raise RuntimeError(
                     "SFT-only co-train phase produced no SFT loss terms. "
                     "Check sft_data_path and sft_co_train.offline_sft_ratio."
                 )
             metrics_data["sft_loss"] = 0.0
+            metrics_data["sft_co_train/scaled_sft"] = 0.0
             if self.sft_rollout_success:
                 metrics_data["sft_loss/rollout_success"] = 0.0
             return

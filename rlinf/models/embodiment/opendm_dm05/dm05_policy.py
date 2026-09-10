@@ -21,9 +21,8 @@ import torch.nn as nn
 from PIL import Image
 from transformers.cache_utils import DynamicCache
 
-from opendm.constants.robot import HISTORY_PAD_TOKEN_ID
 from opendm.model.dm05.dm05_arch import DM05ForConditionalGeneration
-from opendm.model.dm05.dm05_utils import make_suffix_attn_mask
+from opendm.model.dm05.dm05_utils import HISTORY_PAD_TOKEN_ID, make_suffix_attn_mask
 
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.utils.logging import get_logger
@@ -54,7 +53,13 @@ def _as_numpy(value):
 
 
 class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
+    # FSDP (use_orig_params=False) cannot flatten mixed requires_grad tensors.
+    # With train_expert_only the VLM is frozen while the action expert / value
+    # head stay trainable, so each of these units must be a separate wrap.
     _no_split_names = [
+        "vlm",
+        "action_expert",
+        "value_head",
         "action_in_proj",
         "action_out_proj",
         "time_mlp_in",
@@ -94,6 +99,10 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         self.add_state = getattr(config, "add_state", True)
         self.default_speed = str(getattr(config, "default_speed", "0.5"))
         self.default_control_mode = getattr(config, "default_control_mode", None)
+
+        for name, module in self.named_modules():
+            path_parts = name.split(".")
+            setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
     def freeze_vlm(self):
         if not getattr(self.config, "train_expert_only", False):
@@ -245,11 +254,35 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             return [str(p) for p in prompts]
         return [str(p) for p in prompts]
 
+    @staticmethod
+    def _as_per_sample_pixels(pixels: torch.Tensor) -> torch.Tensor:
+        """Normalize processor output to ``[N, C, H, W]`` for one sample."""
+        if pixels.dim() == 5:
+            pixels = pixels.squeeze(0)
+        if pixels.dim() == 3:
+            pixels = pixels.unsqueeze(0)
+        if pixels.dim() != 4:
+            raise ValueError(
+                f"Expected pixel_values [N, C, H, W], got shape {tuple(pixels.shape)}"
+            )
+        return pixels
+
+    @staticmethod
+    def _flatten_pixel_values(pixel_values: torch.Tensor) -> torch.Tensor:
+        """Gemma3 VLM wants ``[B * N, C, H, W]``; PPO routing needs ``[B, N, ...]``."""
+        if pixel_values.dim() == 5:
+            batch, num_images, channels, height, width = pixel_values.shape
+            return pixel_values.reshape(batch * num_images, channels, height, width)
+        return pixel_values
+
     def _pad_and_stack_tokens(self, tokenized_list: list[dict]) -> dict:
         pad_token_id = self.processor.tokenizer.pad_token_id
-        max_len = getattr(self.config, "max_length", 1024)
-        seq_lens = [item["input_ids"].shape[1] for item in tokenized_list]
-        pad_to = min(max(seq_lens), max_len)
+        if pad_token_id is None:
+            pad_token_id = 0
+        # Pad every batch to a fixed length. Per-batch packing (max seq in the
+        # current chunk) makes input_ids [8, 877] vs [8, 881] across chunks,
+        # and trajectory stacking then fails.
+        pad_to = int(getattr(self.config, "max_length", 1024))
 
         input_ids = []
         attention_mask = []
@@ -285,16 +318,15 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             input_ids.append(ids)
             attention_mask.append(mask)
             token_type_ids.append(tti)
-            pixels = item["pixel_values"]
-            if pixels.dim() == 3:
-                pixels = pixels.unsqueeze(0)
-            pixel_values.append(pixels)
+            pixel_values.append(self._as_per_sample_pixels(item["pixel_values"]))
 
         return {
             "input_ids": torch.cat(input_ids, dim=0),
             "attention_mask": torch.cat(attention_mask, dim=0),
             "token_type_ids": torch.cat(token_type_ids, dim=0),
-            "pixel_values": torch.cat(pixel_values, dim=0),
+            # Keep [B, N, C, H, W] so rollout split_sizes match env batch size.
+            # Flatten to [B * N, C, H, W] only when calling the VLM.
+            "pixel_values": torch.stack(pixel_values, dim=0),
         }
 
     def _tokenize_observations(self, processed_obs: dict) -> dict:
@@ -378,7 +410,10 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         timestep = timestep.to(dtype=model_dtype)
 
         suffix_embeds = self.model.action_in_proj(x_t)
-        adarms_cond = self._build_adarms_cond(timestep, suffix_embeds.dtype)
+        # DM05ForConditionalGeneration._build_adarms_cond(time) derives dtype
+        # from time_mlp_in; the extra dtype arg belongs to the infer wrapper.
+        adarms_cond = self._build_adarms_cond(timestep)
+        prefix_len = int(prefix_len)
         suffix_len = int(suffix_embeds.shape[1])
         invisible_prefix_token_ids = (HISTORY_PAD_TOKEN_ID,)
         suffix_attn_mask = make_suffix_attn_mask(
@@ -544,13 +579,15 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             else torch.enable_grad()
         )
         with no_grad_ctx:
-            kv_cache, prefix_len = self._compute_prefix_cache(
+            kv_cache, prefix_hidden_states = self._compute_prefix_cache(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                pixel_values=pixel_values,
+                pixel_values=self._flatten_pixel_values(pixel_values),
                 token_type_ids=token_type_ids,
                 cache_cls=DynamicCache,
             )
+            prefix_len = int(prefix_hidden_states.shape[1])
+            del prefix_hidden_states
 
         x_t = torch.randn(
             batch_size,
@@ -650,13 +687,15 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             else torch.enable_grad()
         )
         with no_grad_ctx:
-            kv_cache, prefix_len = self._compute_prefix_cache(
+            kv_cache, prefix_hidden_states = self._compute_prefix_cache(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                pixel_values=pixel_values,
+                pixel_values=self._flatten_pixel_values(pixel_values),
                 token_type_ids=token_type_ids,
                 cache_cls=DynamicCache,
             )
+            prefix_len = int(prefix_hidden_states.shape[1])
+            del prefix_hidden_states
 
         chains_log_probs = []
         chains_values = []

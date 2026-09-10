@@ -38,7 +38,7 @@ runner:
   resume_dir: null
   # Best available RL policy ckpt (success_once~28.1% @ step 120). keep_critic_weight=False
   # drops value_head so dense training starts with a randomly initialized critic.
-  ckpt_path: "/mnt/pfs/7wsqem/grt/RLinf/logs/20260730-17:39:26-robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/checkpoints/global_step_70/actor/model_state_dict/full_weights.pt"
+  ckpt_path: "/kpfs/data/ruitong_gan/RLinf/logs/20260730-17_39_26-robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/robotwin_blocks_ranking_size_ppo_openpi_pi05_cotrain/checkpoints/global_step_70/actor/model_state_dict/full_weights.pt"
   keep_critic_weight: False
 
 algorithm:
@@ -81,7 +81,7 @@ env:
     max_episode_steps: 1200
     max_steps_per_rollout_epoch: 1200
     group_size: ${algorithm.group_size}
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: null
     center_crop: False
     video_cfg:
@@ -112,7 +112,7 @@ env:
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
-    assets_path: "/mnt/pfs/7wsqem/grt/RoboTwin"
+    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     video_cfg:
       save_video: False
@@ -154,11 +154,11 @@ actor:
   # SFT co-training
   enable_sft_co_train: True
   config_name: "pi05_robotwin_4task"
-  sft_data_path: "/mnt/pfs/7wsqem/grt/starVLA/playground/Datasets/RoboTwin/Clean/blocks_ranking_size"
+  sft_data_path: "/kpfs/data/ruitong_gan/data/RoboTwin/Clean/blocks_ranking_size"
   sft_loss_weight: 2.0
 
   model:
-    model_path: "/mnt/pfs/7wsqem/grt/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_blocks_ranking_size_torch"
+    model_path: "/kpfs/data/ruitong_gan/openpi/checkpoints/pi05_robotwin_4task/pi05_robotwin_4task_blocks_ranking_size_torch"
     num_action_chunks: 50
     action_dim: 14
     add_value_head: True

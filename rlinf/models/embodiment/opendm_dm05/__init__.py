@@ -94,11 +94,17 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         config.default_speed = str(opendm_cfg.get("default_speed", "0.5"))
         config.default_control_mode = opendm_cfg.get("default_control_mode")
 
+        def _state_desc_values(descs) -> list[str]:
+            # HF PretrainedConfig JSON-dumps the config during init; enums are not serializable.
+            return [desc.value if hasattr(desc, "value") else str(desc) for desc in descs]
+
         try:
             robot_enum = RobotType(config.robot_type)
-            config.state_desc = list(ROBOT_STATE_DESCS[robot_enum])
+            config.state_desc = _state_desc_values(ROBOT_STATE_DESCS[robot_enum])
         except (ValueError, KeyError):
-            config.state_desc = list(ROBOT_STATE_DESCS[RobotType.ALOHA_ROBOTWIN2])
+            config.state_desc = _state_desc_values(
+                ROBOT_STATE_DESCS[RobotType.ALOHA_ROBOTWIN2]
+            )
 
         if hasattr(config, "vlm_config") and config.vlm_config is not None:
             if hasattr(config.vlm_config, "text_config"):
