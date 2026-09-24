@@ -28,6 +28,9 @@ This section provides end-to-end evaluation workflows organized by benchmark. Ea
    * - RoboTwin
      - Bimanual manipulation simulation with multiple tasks
      - :doc:`robotwin`
+   * - RoboDojo
+     - Isaac Sim dual-arm benchmark with OpenDM Dual ARX5
+     - :doc:`robodojo`
 
 .. note::
 
@@ -43,3 +46,4 @@ This section provides end-to-end evaluation workflows organized by benchmark. Ea
    maniskill_ood
    polaris
    robotwin
+   robodojo

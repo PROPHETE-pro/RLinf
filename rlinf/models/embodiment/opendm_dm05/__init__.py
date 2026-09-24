@@ -69,6 +69,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         config.add_value_head = cfg.get("add_value_head", True)
         config.noise_level = opendm_cfg.get("noise_level", 0.5)
         config.noise_method = opendm_cfg.get("noise_method", "flow_sde")
+        config.sample_sde_in_eval = bool(
+            opendm_cfg.get("sample_sde_in_eval", False)
+        )
         config.detach_critic_input = opendm_cfg.get("detach_critic_input", True)
         config.train_expert_only = opendm_cfg.get("train_expert_only", True)
         config.output_action_chunks = cfg.num_action_chunks
@@ -98,13 +101,23 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             # HF PretrainedConfig JSON-dumps the config during init; enums are not serializable.
             return [desc.value if hasattr(desc, "value") else str(desc) for desc in descs]
 
-        try:
-            robot_enum = RobotType(config.robot_type)
-            config.state_desc = _state_desc_values(ROBOT_STATE_DESCS[robot_enum])
-        except (ValueError, KeyError):
-            config.state_desc = _state_desc_values(
-                ROBOT_STATE_DESCS[RobotType.ALOHA_ROBOTWIN2]
-            )
+        from rlinf.envs.robodojo.obs_action import (
+            DUAL_ARX5_STATE_DESC,
+            is_dual_arx5_robot_type,
+        )
+
+        if is_dual_arx5_robot_type(config.robot_type):
+            config.state_desc = list(DUAL_ARX5_STATE_DESC)
+            if config.default_control_mode is None:
+                config.default_control_mode = "joint"
+        else:
+            try:
+                robot_enum = RobotType(config.robot_type)
+                config.state_desc = _state_desc_values(ROBOT_STATE_DESCS[robot_enum])
+            except (ValueError, KeyError):
+                config.state_desc = _state_desc_values(
+                    ROBOT_STATE_DESCS[RobotType.ALOHA_ROBOTWIN2]
+                )
 
         if hasattr(config, "vlm_config") and config.vlm_config is not None:
             if hasattr(config.vlm_config, "text_config"):

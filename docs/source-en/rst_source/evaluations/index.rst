@@ -32,6 +32,9 @@ The table below lists benchmarks that have example configs under ``evaluations/`
    * - RoboTwin
      - ``robotwin_place_empty_cup``, ``robotwin_adjust_bottle``, ``robotwin_place_shoe``, ``robotwin_click_bell``
      - ``robotwin/robotwin_place_empty_cup_openvlaoft_eval.yaml``, etc.
+   * - RoboDojo
+     - ``robodojo`` / ``stack_bowls`` (Hydra ``task_name`` for other dual_x5 tasks)
+     - ``robodojo/robodojo_stack_bowls_opendm_dm05_eval.yaml``
    * - RoboCasa365
      - ``robocasa365`` pretrain task slices
      - ``robocasa365/robocasa365_eval_openpi.yaml``
@@ -79,6 +82,8 @@ End-to-end evaluation workflows per benchmark (setup → config → launch → r
      - PolaRiS tabletop manipulation.
    * - :doc:`RoboTwin <guides/robotwin>`
      - RoboTwin bimanual manipulation.
+   * - :doc:`RoboDojo <guides/robodojo>`
+     - RoboDojo Isaac Sim dual-arm (OpenDM Dual ARX5).
 
 Reference
 ---------

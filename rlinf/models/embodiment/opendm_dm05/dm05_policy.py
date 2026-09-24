@@ -607,7 +607,10 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
                 self.get_logprob_norm(x_t, torch.zeros_like(x_t), torch.ones_like(x_t))
             )
 
-        if mode == "train":
+        use_train_sde = mode == "train" or getattr(
+            self.config, "sample_sde_in_eval", False
+        )
+        if use_train_sde:
             if getattr(self.config, "joint_logprob", False):
                 denoise_inds = torch.arange(num_steps)
             elif getattr(self.config, "ignore_last", False):

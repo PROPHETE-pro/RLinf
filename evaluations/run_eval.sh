@@ -29,6 +29,13 @@ setup_sim_env() {
     export ROBOTWIN_PATH="${ROBOTWIN_PATH:-/path/to/RoboTwin}"
     export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH}"
 
+    export ROBODOJO_PATH="${ROBODOJO_PATH:-/kpfs_ssd/data/ruitong_gan/RoboDojo}"
+    export ROBODOJO_PYTHON="${ROBODOJO_PYTHON:-${ROBODOJO_PATH}/../miniconda/envs/RoboDojo/bin/python}"
+    export ROBODOJO_RUNTIME_LIBS="${ROBODOJO_RUNTIME_LIBS:-/kpfs_ssd/data/ruitong_gan/robodojo_runtime/runtime_libs}"
+    export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/kpfs_ssd/data/ruitong_gan/robodojo_runtime/caches/warp}"
+    export ROBODOJO_XDG_CACHE_HOME="${ROBODOJO_XDG_CACHE_HOME:-/kpfs_ssd/data/ruitong_gan/robodojo_runtime/caches}"
+    export OMNI_KIT_ACCEPT_EULA="${OMNI_KIT_ACCEPT_EULA:-YES}"
+
     export DREAMZERO_PATH="${DREAMZERO_PATH:-/path/to/DreamZero}"
     export PYTHONPATH="${DREAMZERO_PATH}:${PYTHONPATH}"
 
@@ -41,6 +48,7 @@ infer_benchmark() {
         behavior_*|behavior-* ) echo "behavior" ;;
         libero_*|libero-* ) echo "libero" ;;
         robotwin_*|robotwin-* ) echo "robotwin" ;;
+        robodojo_*|robodojo-* ) echo "robodojo" ;;
         realworld_*|realworld-* ) echo "realworld" ;;
         maniskill_*|maniskill-* ) echo "maniskill" ;;
         metaworld_*|metaworld-* ) echo "metaworld" ;;

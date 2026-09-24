@@ -1,0 +1,59 @@
+env_type: robodojo
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+
+reward_coef: 1.0
+use_dense_reward: False
+use_custom_reward: True
+use_rel_reward: False
+center_crop: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 800
+max_episode_steps: 800
+
+is_eval: False
+
+# RoboDojo checkout (USD assets live under this tree / Assets symlink).
+robodojo_path: ${oc.env:ROBODOJO_PATH,/kpfs_ssd/data/ruitong_gan/RoboDojo}
+assets_path: ${.robodojo_path}
+isaac_python: ${oc.env:ROBODOJO_PYTHON,/kpfs_ssd/data/ruitong_gan/miniconda/envs/RoboDojo/bin/python}
+env_cfg_type: arx_x5
+runtime_libs: ${oc.env:ROBODOJO_RUNTIME_LIBS,/kpfs_ssd/data/ruitong_gan/robodojo_runtime/runtime_libs}
+warp_cache_path: ${oc.env:WARP_CACHE_PATH,/kpfs_ssd/data/ruitong_gan/robodojo_runtime/caches/warp}
+eval_root: ${oc.env:ROBODOJO_EVAL_ROOT,/kpfs_ssd/data/ruitong_gan/robodojo_runtime/eval_result/RoboDojo/rlinf}
+# Train samples task YAML poses (RNG seed). Eval replays Eval_Layout packs 0/1/2.
+# If unset, RoboDojoEnv uses eval_json when is_eval else procedural.
+layout_mode: null
+# Existing pack dir under Assets/Eval_Layout (read-only symlink; eval_json only).
+layout_pack_seed: 0
+seeds_path: null
+
+video_cfg:
+  save_video: False
+  # -1 keeps every control step in the head-camera video. A positive integer
+  # keeps one frame every N steps (the last step of each chunk is always kept).
+  video_stride: -1
+  # Matches arx_x5 observation.collect_freq so playback tracks control time.
+  fps: 25
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+use_subproc_env: true
+auto_task_horizon: True
+subproc_step_timeout_sec: 180.0
+subproc_ready_timeout_sec: 900.0
+subproc_max_respawns: 999999
+on_subenv_timeout: truncate
+chunk_step_timeout_sec: 0
+
+task_config:
+  task_name: stack_bowls
+  step_lim: 800
+  action_type: joint

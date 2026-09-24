@@ -28,6 +28,9 @@ Benchmark 指南
    * - RoboTwin
      - 双臂操作仿真，多任务场景
      - :doc:`robotwin`
+   * - RoboDojo
+     - Isaac Sim 双臂基准，OpenDM Dual ARX5
+     - :doc:`robodojo`
 
 .. note::
 
@@ -43,3 +46,4 @@ Benchmark 指南
    maniskill_ood
    polaris
    robotwin
+   robodojo

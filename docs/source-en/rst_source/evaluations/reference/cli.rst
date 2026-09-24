@@ -17,6 +17,7 @@ Examples:
 
    bash evaluations/run_eval.sh libero libero_spatial_openpi_pi05_eval
    bash evaluations/run_eval.sh robotwin robotwin_place_empty_cup_openvlaoft_eval
+   bash evaluations/run_eval.sh robodojo robodojo_stack_bowls_opendm_dm05_eval
    bash evaluations/run_eval.sh behavior behavior_openpi_pi05_eval
 
 Option 2: Auto-Infer Benchmark
@@ -45,6 +46,7 @@ Supported Benchmark Prefixes
 
 - ``libero_*`` → libero
 - ``robotwin_*`` → robotwin
+- ``robodojo_*`` → robodojo
 - ``behavior_*`` → behavior
 - ``realworld_*`` → realworld
 - ``maniskill_*`` → maniskill
@@ -59,6 +61,7 @@ Full launch examples per benchmark:
 
 - :doc:`../guides/libero`
 - :doc:`../guides/robotwin`
+- :doc:`../guides/robodojo`
 - :doc:`../guides/behavior`
 - :doc:`../guides/maniskill_ood`
 - :doc:`../guides/realworld`

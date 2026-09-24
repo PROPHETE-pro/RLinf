@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import numbers
 import os
 import warnings
@@ -57,7 +58,12 @@ class RecordVideo(gym.Wrapper):
             ``video_base_dir`` (output directory root),
             ``fps`` (optional FPS override),
             ``info_on_video`` (whether to render overlay text),
-            ``extra_info_on_video`` (list of ``info`` keys to render).
+            ``extra_info_on_video`` (list of ``info`` keys to render),
+            ``concat_wrist_cameras`` (if true, horizontally concat
+            ``main_images`` with ``wrist_images``: Head | Left wrist | Right wrist),
+            ``success_in_filename`` (if true, name files
+            ``{idx}_success.mp4`` / ``{idx}_fail.mp4`` and append
+            ``episode_results.json``).
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
@@ -115,12 +121,54 @@ class RecordVideo(gym.Wrapper):
 
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
+        if self.video_cfg.get("concat_wrist_cameras", False):
+            concatenated = self._concat_main_and_wrist_images(obs)
+            if concatenated is not None:
+                return concatenated
         if hasattr(self.env, "capture_image"):
             return self.env.capture_image()
         for key in ("main_images", "images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
                 return obs[key]
         return None
+
+    def _concat_main_and_wrist_images(self, obs: dict) -> Optional[np.ndarray]:
+        """Horizontally concat head and wrist cameras: Head | Left wrist | Right wrist."""
+        main = obs.get("main_images")
+        wrists = obs.get("wrist_images")
+        if main is None:
+            return None
+        if wrists is None:
+            return self._to_numpy(main)
+
+        main_np = self._to_numpy(main)
+        wrists_np = self._to_numpy(wrists)
+
+        if main_np.ndim == 3:
+            # [H, W, C] plus wrists [K, H, W, C]
+            parts = [main_np]
+            if wrists_np.ndim == 3:
+                parts.append(wrists_np)
+            elif wrists_np.ndim == 4:
+                parts.extend([wrists_np[k] for k in range(wrists_np.shape[0])])
+            else:
+                return main_np
+            return np.concatenate(parts, axis=1)
+
+        if main_np.ndim == 4:
+            # [N, H, W, C] plus wrists [N, K, H, W, C]
+            parts = [main_np]
+            if wrists_np.ndim == 4:
+                parts.append(wrists_np)
+            elif wrists_np.ndim == 5:
+                parts.extend(
+                    [wrists_np[:, k] for k in range(wrists_np.shape[1])]
+                )
+            else:
+                return main_np
+            return np.concatenate(parts, axis=2)
+
+        return main_np
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:
         """Extract a list of per-step image batches from obs."""
@@ -456,7 +504,18 @@ class RecordVideo(gym.Wrapper):
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
         os.makedirs(output_dir, exist_ok=True)
-        mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
+        episode_index = self.video_cnt
+        filename = f"{episode_index}.mp4"
+        success = None
+        if self.video_cfg.get("success_in_filename", False):
+            success = self._episode_success_flag()
+            if success is not None:
+                filename = (
+                    f"{episode_index}_success.mp4"
+                    if success
+                    else f"{episode_index}_fail.mp4"
+                )
+        mp4_path = os.path.join(output_dir, filename)
         frames = list(self.render_images)
         self.render_images = []
         self.video_cnt += 1
@@ -464,6 +523,67 @@ class RecordVideo(gym.Wrapper):
         # Block until the encode + writer.close() returns so the MP4 is valid
         # on disk before the rollout loop continues (or the process exits).
         future.result()
+        if self.video_cfg.get("success_in_filename", False):
+            self._append_episode_result(
+                output_dir=output_dir,
+                episode_index=episode_index,
+                filename=filename,
+                success=success,
+            )
+
+    def _episode_success_flag(self) -> Optional[bool]:
+        """Read per-env ``success_once`` from the wrapped env, if present."""
+        success_once = getattr(self.env, "success_once", None)
+        if success_once is None:
+            return None
+        if torch is not None and isinstance(success_once, torch.Tensor):
+            if success_once.numel() == 0:
+                return None
+            return bool(success_once.reshape(-1)[0].item())
+        if isinstance(success_once, np.ndarray):
+            if success_once.size == 0:
+                return None
+            return bool(success_once.reshape(-1)[0])
+        if isinstance(success_once, (list, tuple)):
+            if len(success_once) == 0:
+                return None
+            return bool(success_once[0])
+        return bool(success_once)
+
+    def _append_episode_result(
+        self,
+        output_dir: str,
+        episode_index: int,
+        filename: str,
+        success: Optional[bool],
+    ) -> None:
+        """Append one episode's success label next to the saved videos."""
+        results_path = os.path.join(output_dir, "episode_results.json")
+        reset_state_id = None
+        reset_ids = getattr(self.env, "reset_state_ids", None)
+        if torch is not None and isinstance(reset_ids, torch.Tensor):
+            if reset_ids.numel() > 0:
+                reset_state_id = int(reset_ids.reshape(-1)[0].item())
+        elif isinstance(reset_ids, np.ndarray) and reset_ids.size > 0:
+            reset_state_id = int(reset_ids.reshape(-1)[0])
+        record = {
+            "episode_index": episode_index,
+            "success": success,
+            "video": filename,
+            "reset_state_id": reset_state_id,
+        }
+        results = []
+        if os.path.isfile(results_path):
+            try:
+                with open(results_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    results = loaded
+            except (OSError, json.JSONDecodeError):
+                results = []
+        results.append(record)
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> Future:
         """Submit a background job to save the video, return its Future."""

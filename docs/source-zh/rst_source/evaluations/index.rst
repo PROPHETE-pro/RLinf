@@ -32,6 +32,9 @@ RLinf 提供统一的具身智能评测入口，支持在仿真或真机环境�
    * - RoboTwin
      - ``robotwin_place_empty_cup``、``robotwin_adjust_bottle``、``robotwin_place_shoe``、``robotwin_click_bell``
      - ``robotwin/robotwin_place_empty_cup_openvlaoft_eval.yaml`` 等
+   * - RoboDojo
+     - ``robodojo`` / ``stack_bowls``（可用 Hydra ``task_name`` 切换其它 dual_x5 任务）
+     - ``robodojo/robodojo_stack_bowls_opendm_dm05_eval.yaml``
    * - RoboCasa365
      - ``robocasa365`` pretrain 任务切片
      - ``robocasa365/robocasa365_eval_openpi.yaml``
@@ -79,6 +82,8 @@ Benchmark 指南
      - PolaRiS 桌面操作。
    * - :doc:`RoboTwin <guides/robotwin>`
      - RoboTwin 双臂操作。
+   * - :doc:`RoboDojo <guides/robodojo>`
+     - RoboDojo Isaac Sim 双臂（OpenDM Dual ARX5）。
 
 参考
 ----

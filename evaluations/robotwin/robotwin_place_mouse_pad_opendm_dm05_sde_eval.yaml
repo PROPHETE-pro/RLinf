@@ -1,0 +1,109 @@
+# Standalone eval: fixed RoboTwin place_mouse_pad seed, 10 independent
+# rollouts with training-style one-step flow_sde (noise_level=0.1).
+# Does not change default OpenDM eval (ODE) unless sample_sde_in_eval is true.
+defaults:
+  - env/robotwin_place_mouse_pad@env.eval
+  - model/opendm_dm05@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    # This host currently exposes 1 GPU; keep a single env worker so the
+    # one-seed json is not partitioned away. Collocate rollout+env on GPU 0.
+    rollout: 0
+    env: 0
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robotwin_place_mouse_pad_opendm_dm05_sde_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null
+  ckpt_path: "/kpfs_ssd/data/ruitong_gan/RLinf/logs/place_mouse_pad/global_step_60/actor/model_state_dict/full_weights.pt"
+  keep_critic_weight: False
+
+env:
+  group_name: "EnvGroup"
+  enable_offload: False
+  eval:
+    rollout_epoch: 10
+    total_num_envs: 1
+    auto_reset: False
+    ignore_terminations: True
+    max_episode_steps: 400
+    reward_coef: 1.0
+    max_steps_per_rollout_epoch: 400
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    is_eval: True
+    instruction_type: full_description
+    assets_path: "/kpfs_ssd/data/ruitong_gan/RoboTwin"
+    seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds_place_mouse_pad_one.json
+    video_cfg:
+      save_video: True
+      concat_wrist_cameras: False
+      extra_info_on_video: ["episode.success_once"]
+      success_in_filename: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    center_crop: False
+    task_config:
+      step_lim: 400
+      planner_backend: mplib
+      embodiment: [aloha-agilex]
+      camera:
+        collect_wrist_camera: true
+      domain_randomization:
+        random_background: false
+        cluttered_table: false
+        clean_background_rate: 1
+        random_head_camera_dis: 0
+        random_table_height: 0
+        random_light: false
+        crazy_random_light_rate: 0
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  recompute_logprobs: False
+  enable_offload: False
+  pipeline_stage_num: 1
+  model:
+    model_path: "/kpfs_ssd/data/ruitong_gan/opendm/checkpoints/dm05_robotwin"
+    precision: "bf16"
+    num_action_chunks: 50
+    action_dim: 14
+    add_value_head: True
+    num_steps: 5
+    opendm:
+      num_images_in_input: 3
+      image_prompts: ["Head", "Left wrist", "Right wrist"]
+      robot_type: "Aloha RoboTwin2"
+      add_state: True
+      action_mode: "absolute"
+      noise_level: 0.1
+      action_chunk: ${rollout.model.num_action_chunks}
+      num_steps: ${rollout.model.num_steps}
+      train_expert_only: True
+      action_env_dim: ${rollout.model.action_dim}
+      noise_method: "flow_sde"
+      sample_sde_in_eval: True
+      add_value_head: ${rollout.model.add_value_head}
+      detach_critic_input: True

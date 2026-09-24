@@ -1,0 +1,94 @@
+# Standalone eval: RoboDojo stack_bowls with OpenDM dm05_robodojo.
+defaults:
+  - env/robodojo@env.eval
+  - model/opendm_dm05@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout: 1
+    env: 0
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robodojo_stack_bowls_opendm_dm05_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null
+  ckpt_path: null
+  keep_critic_weight: False
+
+env:
+  group_name: "EnvGroup"
+  enable_offload: False
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: False
+    ignore_terminations: True
+    max_episode_steps: 800
+    reward_coef: 1.0
+    max_steps_per_rollout_epoch: 800
+    group_size: 1
+    use_fixed_reset_state_ids: False
+    is_eval: True
+    layout_mode: eval_json
+    use_dense_reward: False
+    use_rel_reward: False
+    use_custom_reward: True
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    center_crop: False
+    task_config:
+      task_name: stack_bowls
+      step_lim: 800
+      action_type: joint
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  recompute_logprobs: False
+  enable_offload: False
+  pipeline_stage_num: 1
+  model:
+    model_path: "/kpfs_ssd/data/ruitong_gan/opendm/checkpoints/dm05_robodojo"
+    precision: "bf16"
+    num_action_chunks: 50
+    action_dim: 14
+    add_value_head: True
+    num_steps: 5
+    opendm:
+      num_images_in_input: 3
+      image_prompts: ["Head", "Left wrist", "Right wrist"]
+      robot_type: "Dual ARX5"
+      add_state: True
+      action_mode: "absolute"
+      noise_level: 0.1
+      action_chunk: ${rollout.model.num_action_chunks}
+      num_steps: ${rollout.model.num_steps}
+      train_expert_only: True
+      action_env_dim: ${rollout.model.action_dim}
+      noise_method: "flow_sde"
+      sample_sde_in_eval: True
+      add_value_head: ${rollout.model.add_value_head}
+      detach_critic_input: True
+      default_control_mode: "joint"

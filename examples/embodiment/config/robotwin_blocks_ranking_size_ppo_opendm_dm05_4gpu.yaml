@@ -84,7 +84,7 @@ env:
     max_episode_steps: 1200
     max_steps_per_rollout_epoch: 1200
     group_size: ${algorithm.group_size}
-    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
+    assets_path: "/kpfs_ssd/data/ruitong_gan/RoboTwin"
     seeds_path: null
     use_fixed_reset_state_ids: False
     instruction_type: full_description
@@ -126,7 +126,7 @@ env:
     group_size: 1
     use_fixed_reset_state_ids: True
     is_eval: True
-    assets_path: "/kpfs/data/ruitong_gan/RoboTwin"
+    assets_path: "/kpfs_ssd/data/ruitong_gan/RoboTwin"
     seeds_path: ${oc.env:REPO_PATH}/rlinf/envs/robotwin/seeds/eval_seeds.json
     instruction_type: full_description
     video_cfg:
@@ -150,7 +150,9 @@ env:
 rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
-  recompute_logprobs: False
+  # Recompute old_logprobs on the actor (eval, no dropout) so PPO ratio is not
+  # inflated by rollout eval() vs actor train() / FSDP vs HuggingFace mismatch.
+  recompute_logprobs: True
   enable_offload: False
   pipeline_stage_num: 1
   model:
@@ -168,7 +170,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/kpfs/data/ruitong_gan/opendm/checkpoints/dm05_robotwin"
+    model_path: "/kpfs_ssd/data/ruitong_gan/opendm/checkpoints/dm05_robotwin"
     precision: "bf16"
     num_action_chunks: 50
     action_dim: 14
