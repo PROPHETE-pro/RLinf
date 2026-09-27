@@ -292,20 +292,40 @@ def preprocess_loss_inputs(
     versions: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
-    if reward_type == "chunk_level":
-        advantages = advantages.flatten()
-        if loss_mask is not None:
-            loss_mask = loss_mask.flatten()
-        if loss_mask_sum is not None:
-            loss_mask_sum = loss_mask_sum.flatten()
-        if values is not None:
-            values = values.flatten()
-        if prev_values is not None:
-            prev_values = prev_values.flatten()
-        if returns is not None:
-            returns = returns.flatten()
-
     bsz = logprobs.shape[0]
+    per_step_advantage = False
+    if reward_type == "chunk_level":
+        action_steps = None
+        if logprobs.ndim >= 2 and single_action_dim:
+            action_steps = logprobs.reshape(bsz, -1, single_action_dim).shape[1]
+        per_step_advantage = (
+            logprob_type == "action_level"
+            and action_steps is not None
+            and advantages.shape[-1] == action_steps
+        )
+        if per_step_advantage:
+            advantages = advantages.reshape(bsz, action_steps)
+        else:
+            advantages = advantages.flatten()
+        if loss_mask is not None and not per_step_advantage:
+            loss_mask = loss_mask.flatten()
+        elif loss_mask is not None:
+            loss_mask = loss_mask.reshape(bsz, -1)[:, :1]
+        if loss_mask_sum is not None and not per_step_advantage:
+            loss_mask_sum = loss_mask_sum.flatten()
+        elif loss_mask_sum is not None:
+            loss_mask_sum = loss_mask_sum.reshape(bsz, -1)[:, :1]
+        if values is not None:
+            values = values.reshape(bsz, -1)[:, :1] if per_step_advantage else values.flatten()
+        if prev_values is not None:
+            prev_values = (
+                prev_values.reshape(bsz, -1)[:, :1]
+                if per_step_advantage
+                else prev_values.flatten()
+            )
+        if returns is not None:
+            returns = returns.reshape(bsz, -1)[:, :1] if per_step_advantage else returns.flatten()
+
     proximal_logprobs = kwargs.get("proximal_logprobs", None)
     if logprob_type == "token_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz, num_action_chunks, action_dim]

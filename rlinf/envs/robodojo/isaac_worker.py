@@ -103,6 +103,9 @@ def _obs_payload(env) -> dict[str, Any]:
             "step_lim": int(env.step_lim),
         }
     )
+    dense_progress = getattr(env, "dense_progress", None)
+    if dense_progress is not None:
+        payload["dense_progress"] = float(dense_progress)
     return payload
 
 
@@ -166,6 +169,7 @@ def _reset_with_retries(env, seed: int, max_tries: int = 20):
             env.reset(seed=[try_seed])
             if hasattr(env, "run_reward"):
                 env.run_reward()
+            _bind_dense_progress(env)
             return try_seed
         except UnStableError as exc:
             last_error = exc
@@ -209,6 +213,28 @@ def _video_record_every() -> Optional[int]:
     return 1 if stride <= 0 else stride
 
 
+def _bind_dense_progress(env) -> None:
+    """Attach the training progress tracker. Official success checks stay unchanged."""
+    if not hasattr(env, "dense_stage_spec"):
+        env._dense_progress = None
+        return
+    from env.reward_manager.dense_progress import DenseProgress
+
+    tracker = DenseProgress(env)
+    tracker.reset()
+    env._dense_progress = tracker
+
+
+def _read_dense_progress(env) -> Optional[float]:
+    tracker = getattr(env, "_dense_progress", None)
+    if tracker is None:
+        return None
+    value = tracker.step()
+    if value is None:
+        return None
+    return float(value)
+
+
 def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
     chunk = np.asarray(actions, dtype=np.float32)
     if chunk.ndim == 1:
@@ -218,15 +244,23 @@ def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
     every = _video_record_every()
     last_payload = None
     head_frames: list[np.ndarray] = []
+    progress_trace: list[float] = []
     for row in chunk:
         if env.end_flag[0]:
             break
         env.take_action(unpack_joint_action(row))
+        phi = _read_dense_progress(env)
+        if phi is not None:
+            progress_trace.append(phi)
         last_payload = _obs_payload(env)
         if every is not None:
             head_frames.append(np.array(last_payload["full_image"], copy=True))
     if last_payload is None:
         last_payload = _obs_payload(env)
+    if progress_trace:
+        last_payload = dict(last_payload)
+        last_payload["dense_progress"] = progress_trace[-1]
+        last_payload["dense_progress_trace"] = progress_trace
     if every is not None and head_frames:
         kept = select_video_indices(len(head_frames), -1 if every == 1 else every)
         last_payload = dict(last_payload)
@@ -355,6 +389,9 @@ def _build_env(args_cli):
 
     simulation_app = args_cli._simulation_app
     env = create_eval_env(env_cfg, app=simulation_app)
+    rollout_step_lim = getattr(args_cli, "rollout_step_lim", None)
+    if rollout_step_lim is not None and int(rollout_step_lim) > 0:
+        env.step_lim = int(rollout_step_lim)
     # RL does not persist eval videos; skip ffmpeg streams and last-frame dumps.
     env._stream_vision = lambda *args, **kwargs: None  # type: ignore[method-assign]
     env.save_video = lambda *args, **kwargs: None  # type: ignore[method-assign]
@@ -439,6 +476,12 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     parser.add_argument("--standalone", action="store_true")
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument(
+        "--rollout_step_lim",
+        type=int,
+        default=None,
+        help="Train-only override of the sim episode limit. Eval omits this.",
+    )
     parser.add_argument("--ipc-path", type=str, default="")
     parser.add_argument("--auth-key", type=str, default="")
     from isaaclab.app import AppLauncher

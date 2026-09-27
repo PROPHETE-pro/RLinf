@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 
 from rlinf.envs.robodojo.obs_action import ACTION_DIM
+from rlinf.envs.robodojo.reward import chunk_reward_from_cumulative, cumulative_score
 from rlinf.envs.robodojo.subproc_vector_env import SubprocVectorEnv
 from rlinf.envs.robodojo.task_inventory import COMPETITION_TASKS, get_task_horizon
 from rlinf.envs.utils import center_crop_image, list_of_dict_to_dict_of_list
@@ -59,6 +60,11 @@ class RoboDojoEnv(gym.Env):
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.use_custom_reward = cfg.use_custom_reward
         self.use_dense_reward = bool(cfg.get("use_dense_reward", False))
+        self.dense_shaping_coef = float(cfg.get("dense_shaping_coef", 0.5))
+        self.dense_success_reward = float(cfg.get("dense_success_reward", 1.0))
+        self.success_deadline_mode = str(cfg.get("success_deadline_mode", "hard"))
+        self.success_decay_steps = float(cfg.get("success_decay_steps", 525))
+        self.time_cost_per_step = float(cfg.get("time_cost_per_step", 0.0))
         self.video_cfg = cfg.video_cfg
         self.cfg = cfg
         self.record_metrics = record_metrics
@@ -70,6 +76,9 @@ class RoboDojoEnv(gym.Env):
         self._init_env()
         self.prev_step_reward = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.prev_step_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
         )
         if self.record_metrics:
             self._init_metrics()
@@ -112,6 +121,12 @@ class RoboDojoEnv(gym.Env):
                 + ", ".join(unsupported)
             )
 
+    def _optional_int(self, key: str) -> Optional[int]:
+        value = self.cfg.get(key, None)
+        if value is None:
+            return None
+        return int(value)
+
     def _init_task_horizons(self):
         robodojo_path = self._resolve_robodojo_path()
         horizons: list[int] = []
@@ -124,19 +139,41 @@ class RoboDojoEnv(gym.Env):
         self.task_horizons = {
             name: horizon for name, horizon in zip(self.task_names, horizons)
         }
-        per_env = [self.task_horizons[name] for name in self.per_env_task_names]
-        self.per_env_horizons = torch.as_tensor(
-            per_env, dtype=torch.long, device=self.device
+        configured_official = self._optional_int("official_step_lim")
+        if configured_official is not None:
+            official_per_env = [configured_official] * self.num_envs
+        else:
+            official_per_env = [
+                self.task_horizons[name] for name in self.per_env_task_names
+            ]
+        self.official_step_lims = torch.as_tensor(
+            official_per_env, dtype=torch.long, device=self.device
         )
-        max_horizon = max(horizons) if horizons else int(self.cfg.max_episode_steps)
-        if bool(self.cfg.get("auto_task_horizon", True)):
-            self.cfg.max_episode_steps = max_horizon
+        is_eval = bool(self.cfg.get("is_eval", False))
+        configured_rollout = None if is_eval else self._optional_int("rollout_step_lim")
+        if configured_rollout is None:
+            rollout_per_env = list(official_per_env)
+        else:
+            rollout_per_env = [configured_rollout] * self.num_envs
+        self.rollout_step_lims = torch.as_tensor(
+            rollout_per_env, dtype=torch.long, device=self.device
+        )
+        self.per_env_horizons = self.rollout_step_lims.clone()
+        self._worker_rollout_step_lim = configured_rollout
+        max_rollout = max(rollout_per_env) if rollout_per_env else int(
+            self.cfg.max_episode_steps
+        )
+        if bool(self.cfg.get("auto_task_horizon", True)) or configured_rollout is not None:
+            self.cfg.max_episode_steps = max_rollout
             if OmegaConf.select(self.cfg, "max_steps_per_rollout_epoch", default=None) is not None:
                 self.cfg.max_steps_per_rollout_epoch = max(
-                    int(self.cfg.max_steps_per_rollout_epoch), max_horizon
+                    int(self.cfg.max_steps_per_rollout_epoch), max_rollout
                 )
             OmegaConf.update(
-                self.cfg, "task_config.step_lim", max_horizon, merge=False
+                self.cfg,
+                "task_config.step_lim",
+                int(max(official_per_env)),
+                merge=False,
             )
 
     def _resolve_isaac_python(self) -> str:
@@ -209,6 +246,7 @@ class RoboDojoEnv(gym.Env):
             on_timeout=str(self.cfg.get("on_subenv_timeout", "truncate")),
             per_env_task_names=self.per_env_task_names,
             extra_env=extra_env,
+            rollout_step_lim=self._worker_rollout_step_lim,
         )
 
     @property
@@ -231,6 +269,9 @@ class RoboDojoEnv(gym.Env):
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.success_within_official = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self.fail_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -243,15 +284,19 @@ class RoboDojoEnv(gym.Env):
             mask = torch.zeros(self.num_envs, dtype=bool, device=self.device)
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
+            self.prev_step_count[mask] = 0
             if self.record_metrics:
                 self.success_once[mask] = False
+                self.success_within_official[mask] = False
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
                 self._elapsed_steps[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
+            self.prev_step_count[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
+                self.success_within_official[:] = False
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
                 self._elapsed_steps[:] = 0
@@ -265,7 +310,10 @@ class RoboDojoEnv(gym.Env):
                     np.array(infos["success"]).reshape(-1), device=self.device
                 )
             self.success_once = self.success_once | infos["success"]
+            within = self._success_within_official(infos)
             episode_info["success_once"] = self.success_once.clone()
+            episode_info["success_any"] = self.success_once.clone()
+            episode_info["success_within_official"] = within
             for task_idx, task_name in enumerate(self.task_names):
                 mask = self.task_ids_tensor == task_idx
                 episode_info[f"success_once/{task_name}"] = (
@@ -320,13 +368,84 @@ class RoboDojoEnv(gym.Env):
             "task_ids": self.task_ids_tensor.clone(),
         }
 
-    def _calc_step_reward(self, terminations):
-        reward = self.cfg.reward_coef * terminations
-        reward_diff = reward - self.prev_step_reward
-        self.prev_step_reward = reward
-        if self.use_rel_reward:
-            return reward_diff
-        return reward
+    def _info_float_list(self, infos, key: str) -> list[float | None]:
+        if not isinstance(infos, dict) or key not in infos:
+            return [None] * self.num_envs
+        value = infos[key]
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().tolist()
+        elif isinstance(value, np.ndarray):
+            value = value.reshape(-1).tolist()
+        elif not isinstance(value, list):
+            value = [value]
+        padded: list[float | None] = []
+        for item in value:
+            if item is None:
+                padded.append(None)
+            else:
+                padded.append(float(item))
+        while len(padded) < self.num_envs:
+            padded.append(None)
+        return padded[: self.num_envs]
+
+    def _info_int_list(self, infos, key: str) -> list[int | None]:
+        values = self._info_float_list(infos, key)
+        parsed: list[int | None] = []
+        for item in values:
+            parsed.append(None if item is None else int(item))
+        return parsed
+
+    def _success_within_official(self, infos) -> torch.Tensor:
+        success = infos.get("success")
+        if not isinstance(success, torch.Tensor):
+            success = torch.as_tensor(
+                np.array(success).reshape(-1), device=self.device, dtype=torch.bool
+            )
+        steps = self._info_int_list(infos, "step_count")
+        within = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for index, step_count in enumerate(steps):
+            if not bool(success[index]):
+                continue
+            limit = int(self.official_step_lims[index])
+            if step_count is None or step_count <= limit:
+                within[index] = True
+        self.success_within_official = self.success_within_official | within
+        return self.success_within_official.clone()
+
+    def _chunk_rewards_from_info(
+        self, terminations: torch.Tensor, infos, executed_steps: int
+    ) -> torch.Tensor:
+        progresses = self._info_float_list(infos, "dense_progress")
+        step_counts = self._info_int_list(infos, "step_count")
+        rewards = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        for index in range(self.num_envs):
+            step_count = step_counts[index]
+            if step_count is None:
+                step_count = int(self.prev_step_count[index]) + int(executed_steps)
+            executed = step_count - int(self.prev_step_count[index])
+            if executed < 0:
+                executed = int(executed_steps)
+            progress = progresses[index]
+            cumulative = cumulative_score(
+                success=bool(terminations[index]),
+                step_count=int(step_count),
+                official_step_lim=int(self.official_step_lims[index]),
+                deadline_mode=self.success_deadline_mode,
+                decay_steps=self.success_decay_steps,
+                dense_progress=progress,
+                use_dense_reward=self.use_dense_reward,
+                shaping_coef=self.dense_shaping_coef,
+                success_reward=self.dense_success_reward * float(self.cfg.reward_coef),
+            )
+            rewards[index] = chunk_reward_from_cumulative(
+                cumulative,
+                float(self.prev_step_reward[index]),
+                self.time_cost_per_step,
+                executed,
+            )
+            self.prev_step_reward[index] = cumulative
+            self.prev_step_count[index] = int(step_count)
+        return rewards
 
     def _to_tensor_reward(self, step_reward):
         if isinstance(step_reward, torch.Tensor):
@@ -336,15 +455,66 @@ class RoboDojoEnv(gym.Env):
             device=self.device,
         )
 
-    def _prepare_step_reward(self, step_reward, terminations: torch.Tensor):
-        if self.use_custom_reward:
-            return self._calc_step_reward(terminations)
+    def _prepare_step_reward(
+        self, step_reward, terminations: torch.Tensor, infos=None, executed_steps: int = 1
+    ):
+        if self.use_custom_reward or self.use_dense_reward:
+            return self._chunk_rewards_from_info(
+                terminations, infos or {}, executed_steps
+            )
         step_reward = self._to_tensor_reward(step_reward)
         if self.use_rel_reward:
             reward_diff = step_reward - self.prev_step_reward
             self.prev_step_reward = step_reward
             return reward_diff
         return step_reward
+
+    def _rewards_from_progress_trace(
+        self, terminations: torch.Tensor, infos, chunk_step: int
+    ) -> torch.Tensor | None:
+        """Per-control-step progress deltas. Missing traces keep the last-cell reward."""
+        traces = infos.get("dense_progress_trace") if isinstance(infos, dict) else None
+        if not traces:
+            return None
+        rewards = torch.zeros(
+            self.num_envs, chunk_step, dtype=torch.float32, device=self.device
+        )
+        step_counts = self._info_int_list(infos, "step_count")
+        any_trace = False
+        for index in range(self.num_envs):
+            trace = traces[index] if index < len(traces) else None
+            if not trace:
+                continue
+            any_trace = True
+            prev = float(self.prev_step_reward[index])
+            base_count = int(self.prev_step_count[index])
+            used = list(trace)[:chunk_step]
+            final_count = step_counts[index]
+            if final_count is None:
+                final_count = base_count + len(used)
+            for offset, phi in enumerate(used):
+                last = offset == len(used) - 1
+                step_count = int(final_count) if last else base_count + offset + 1
+                cumulative = cumulative_score(
+                    success=bool(terminations[index]) and last,
+                    step_count=step_count,
+                    official_step_lim=int(self.official_step_lims[index]),
+                    deadline_mode=self.success_deadline_mode,
+                    decay_steps=self.success_decay_steps,
+                    dense_progress=float(phi),
+                    use_dense_reward=self.use_dense_reward,
+                    shaping_coef=self.dense_shaping_coef,
+                    success_reward=self.dense_success_reward * float(self.cfg.reward_coef),
+                )
+                rewards[index, offset] = (
+                    cumulative - prev - self.time_cost_per_step
+                )
+                prev = cumulative
+            self.prev_step_reward[index] = prev
+            self.prev_step_count[index] = int(final_count)
+        if not any_trace:
+            return None
+        return rewards
 
     def _cal_chunk_rewards(
         self, step_reward: torch.Tensor, chunk_step: int, terminations: torch.Tensor
@@ -386,7 +556,9 @@ class RoboDojoEnv(gym.Env):
         truncations = torch.as_tensor(
             np.array(truncations).reshape(-1), device=self.device
         )
-        step_reward = self._prepare_step_reward(step_reward, terminations)
+        step_reward = self._prepare_step_reward(
+            step_reward, terminations, infos, executed_steps=int(actions.shape[1])
+        )
         self._elapsed_steps += actions.shape[1]
         truncated = torch.logical_or(
             self._elapsed_steps >= self.cfg.max_episode_steps,
@@ -425,8 +597,17 @@ class RoboDojoEnv(gym.Env):
         truncations = torch.as_tensor(
             np.array(truncations).reshape(-1), device=self.device
         )
-        step_reward = self._prepare_step_reward(step_reward, terminations)
-        chunk_rewards = self._cal_chunk_rewards(step_reward, chunk_step, terminations)
+        traced = self._rewards_from_progress_trace(terminations, infos, chunk_step)
+        if traced is None:
+            step_reward = self._prepare_step_reward(
+                step_reward, terminations, infos, executed_steps=int(chunk_step)
+            )
+            chunk_rewards = self._cal_chunk_rewards(
+                step_reward, chunk_step, terminations
+            )
+        else:
+            chunk_rewards = traced
+            step_reward = traced.sum(dim=-1)
         self._elapsed_steps += chunk_actions.shape[1]
         truncated = torch.logical_or(
             self._elapsed_steps >= self.cfg.max_episode_steps,

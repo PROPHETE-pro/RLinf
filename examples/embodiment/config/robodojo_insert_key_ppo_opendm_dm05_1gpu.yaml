@@ -1,4 +1,4 @@
-# Single-GPU PPO on RoboDojo build_tower (Dual ARX5 / OpenDM dm05_robodojo).
+# Single-GPU PPO on RoboDojo insert_key with precision dense progress.
 # Isaac worker and OpenDM actor/rollout share GPU 0; world_size=1, 1 env.
 defaults:
   - env/robodojo@env.train
@@ -25,7 +25,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "robodojo_build_tower_ppo_opendm_dm05_1gpu"
+    experiment_name: "robodojo_insert_key_ppo_opendm_dm05_1gpu"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -45,7 +45,8 @@ algorithm:
   reward_coef: 1.0
 
   reward_type: chunk_level
-  logprob_type: chunk_level
+  logprob_type: action_level
+  intra_chunk_advantage: True
   entropy_type: token_level
 
   update_epoch: 4
@@ -75,20 +76,20 @@ env:
     total_num_envs: 1
     chunk_step_timeout_sec: 0
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 2100
-    max_steps_per_rollout_epoch: 2100
+    max_episode_steps: 600
+    max_steps_per_rollout_epoch: 600
     group_size: ${algorithm.group_size}
     seed: 0
     layout_mode: procedural
     use_fixed_reset_state_ids: False
     center_crop: False
-    use_dense_reward: False
-    dense_shaping_coef: 0.5
+    use_dense_reward: True
+    dense_shaping_coef: 1.0
     dense_success_reward: 1.0
     use_rel_reward: False
     use_custom_reward: True
-    official_step_lim: 1050
-    rollout_step_lim: 2100
+    official_step_lim: 300
+    rollout_step_lim: 600
     success_deadline_mode: hard
     success_decay_steps: 525
     time_cost_per_step: 0.0004
@@ -99,8 +100,8 @@ env:
       video_stride: -1
       fps: 25
     task_config:
-      task_name: build_tower
-      step_lim: 1050
+      task_name: insert_key
+      step_lim: 300
       action_type: joint
   eval:
     rollout_epoch: 1
@@ -110,9 +111,9 @@ env:
     use_dense_reward: False
     use_rel_reward: False
     use_custom_reward: True
-    max_episode_steps: 1050
+    max_episode_steps: 300
     reward_coef: ${algorithm.reward_coef}
-    max_steps_per_rollout_epoch: 1050
+    max_steps_per_rollout_epoch: 300
     group_size: 1
     use_fixed_reset_state_ids: False
     is_eval: True
@@ -125,8 +126,8 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/eval
     center_crop: False
     task_config:
-      task_name: build_tower
-      step_lim: 1050
+      task_name: insert_key
+      step_lim: 300
       action_type: joint
 
 rollout:

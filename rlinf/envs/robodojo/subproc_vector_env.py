@@ -80,9 +80,16 @@ def normalize_step_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized["truncated"] = _to_scalar_array(
         result.get("truncated", 0), dtype=np.int32
     )
-    info = result.get("info") or {}
+    info = dict(result.get("info") or {})
     info.setdefault("success", bool(result.get("success", False)))
     info.setdefault("sub_env_id", result.get("sub_env_id"))
+    if result.get("step_count") is not None:
+        info["step_count"] = int(result["step_count"])
+    if result.get("dense_progress") is not None:
+        info["dense_progress"] = float(result["dense_progress"])
+    trace = result.get("dense_progress_trace")
+    if trace:
+        info["dense_progress_trace"] = [float(item) for item in trace]
     normalized["info"] = info
     return normalized
 
@@ -174,6 +181,7 @@ class IsaacSubEnvWorker:
         max_respawns: int = 10,
         on_timeout: OnTimeoutPolicy = "truncate",
         extra_env: Optional[dict[str, str]] = None,
+        rollout_step_lim: Optional[int] = None,
     ) -> None:
         self.env_id = env_id
         self.task_name = task_name
@@ -186,6 +194,7 @@ class IsaacSubEnvWorker:
         self.max_respawns = int(max_respawns)
         self.on_timeout = on_timeout
         self.extra_env = extra_env or {}
+        self.rollout_step_lim = rollout_step_lim
         self.respawn_count = 0
         self.process: Optional[subprocess.Popen] = None
         self.conn = None
@@ -223,6 +232,8 @@ class IsaacSubEnvWorker:
             "--headless",
             "--enable_cameras",
         ]
+        if self.rollout_step_lim is not None:
+            cmd.extend(["--rollout_step_lim", str(int(self.rollout_step_lim))])
         layout_mode = str(self.extra_env.get("ROBODOJO_LAYOUT_MODE") or "").strip()
         if layout_mode:
             cmd.extend(["--layout_mode", layout_mode])
@@ -513,6 +524,7 @@ class SubprocVectorEnv(gym.Env):
         on_timeout: OnTimeoutPolicy = "truncate",
         per_env_task_names: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
+        rollout_step_lim: Optional[int] = None,
     ) -> None:
         if not isaac_python or not os.path.isfile(isaac_python):
             raise ValueError(
@@ -538,6 +550,7 @@ class SubprocVectorEnv(gym.Env):
         self.max_respawns = max_respawns
         self.on_timeout = on_timeout
         self.extra_env = extra_env or {}
+        self.rollout_step_lim = rollout_step_lim
         self.workers: list[IsaacSubEnvWorker] = []
         self._init_workers()
 
@@ -558,6 +571,7 @@ class SubprocVectorEnv(gym.Env):
                     max_respawns=self.max_respawns,
                     on_timeout=self.on_timeout,
                     extra_env=self.extra_env,
+                    rollout_step_lim=self.rollout_step_lim,
                 )
             )
 

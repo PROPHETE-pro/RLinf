@@ -78,7 +78,7 @@ def _setup_env() -> None:
         sys.path.insert(0, str(RLINF))
 
 
-def _load_train_cfg():
+def _load_train_cfg(config_name: str, extra_overrides: list[str] | None = None):
     from hydra import compose, initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
 
@@ -87,10 +87,11 @@ def _load_train_cfg():
     config_dir = str(RLINF / "examples" / "embodiment" / "config")
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         return compose(
-            config_name="robodojo_build_tower_ppo_opendm_dm05_1gpu",
+            config_name=config_name,
             overrides=[
                 "env.train.total_num_envs=1",
                 "env.train.video_cfg.save_video=false",
+                *(extra_overrides or []),
             ],
         )
 
@@ -150,6 +151,101 @@ def _panel(head, left, right, title: str) -> np.ndarray:
         x += tile.width
     draw.text((width // 2, 8), title, fill=(255, 220, 80))
     return np.asarray(canvas)
+
+
+def _info_float(infos, key: str) -> float | None:
+    if not isinstance(infos, dict) or key not in infos:
+        return None
+    value = infos[key]
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 0 or not np.isfinite(arr[0]):
+        return None
+    return float(arr[0])
+
+
+def _tensor_float(value) -> float:
+    if hasattr(value, "detach"):
+        value = value.detach().float().cpu().numpy()
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    return float(arr[0]) if arr.size else 0.0
+
+
+def _reward_strip(
+    width: int,
+    horizon: int,
+    scores: list[float],
+    chunk_spans: list[tuple[int, int, float | None]],
+    cursor: int,
+    phi: float | None,
+    height: int = 176,
+) -> np.ndarray:
+    """Cumulative score without the per-step time cost. Up is green, down is red."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), (14, 14, 16))
+    draw = ImageDraw.Draw(image)
+    current = scores[-1] if scores else 0.0
+    title = (
+        f"score(no time cost)={current:.4f}   "
+        f"phi={phi if phi is not None else float('nan'):.3f}"
+    )
+    draw.text((8, 4), title, fill=(240, 240, 240))
+    left, right, top, bottom = 8, max(9, width - 8), 28, height - 22
+    slots = max(int(horizon), 1)
+    plot_w = right - left
+    plot_h = max(bottom - top, 1)
+    y_max = 1.0
+
+    def x_at(step: int) -> int:
+        return left + int(min(step, slots) * plot_w / slots)
+
+    def y_at(score: float) -> int:
+        clipped = min(y_max, max(0.0, float(score)))
+        return bottom - int(clipped / y_max * plot_h)
+
+    for span_index, (start, end, _gain) in enumerate(chunk_spans):
+        x0 = x_at(start)
+        x1 = max(x_at(end), x0 + 1)
+        shade = (24, 36, 32) if span_index % 2 == 0 else (36, 28, 28)
+        draw.rectangle((x0, top, x1, bottom), fill=shade)
+    for mark in (0.25, 0.5, 0.75, 1.0):
+        y = y_at(mark)
+        draw.line((left, y, right, y), fill=(55, 55, 58))
+        draw.text((left + 2, y - 11), f"{mark:.2f}", fill=(120, 120, 120))
+    draw.line((left, bottom, right, bottom), fill=(90, 90, 90))
+    points = [(x_at(0), y_at(0.0))]
+    points.extend((x_at(index + 1), y_at(score)) for index, score in enumerate(scores))
+    for start, end in zip(points, points[1:]):
+        delta = end[1] - start[1]
+        if delta < -1:
+            color = (70, 190, 90)
+        elif delta > 1:
+            color = (210, 70, 70)
+        else:
+            color = (220, 210, 150)
+        draw.line((start, end), fill=color, width=3)
+    for start, _end, _gain in chunk_spans:
+        x0 = x_at(start)
+        draw.line((x0, top, x0, bottom), fill=(235, 235, 235), width=2)
+    cursor_x = x_at(cursor)
+    draw.line((cursor_x, top, cursor_x, bottom), fill=(255, 210, 60), width=2)
+    draw.text(
+        (8, height - 16),
+        "curve = cumulative score without time cost    green up / red down    white = chunk start    yellow = now",
+        fill=(180, 180, 180),
+    )
+    return np.asarray(image)
+
+
+def _compose_frame(cameras: np.ndarray, strip: np.ndarray) -> np.ndarray:
+    if cameras.shape[1] != strip.shape[1]:
+        from PIL import Image
+
+        strip_img = Image.fromarray(strip).resize((cameras.shape[1], strip.shape[0]))
+        strip = np.asarray(strip_img)
+    return np.concatenate([cameras, strip], axis=0)
 
 
 def _write_video(path: Path, frames: list[np.ndarray], fps: int = 10) -> None:
@@ -299,6 +395,34 @@ def _info_flag(infos, key: str) -> bool:
     return bool(arr[0])
 
 
+def _plot_rewards(
+    path: Path,
+    scores: np.ndarray,
+    dense_phi: np.ndarray,
+    chunk_len: int,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = np.arange(1, scores.shape[0] + 1)
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(steps, scores, color="C0", linewidth=1.6, label="score without time cost")
+    ax.plot(steps, dense_phi, color="C1", linewidth=1.0, alpha=0.7, label="dense phi")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_ylabel("cumulative score")
+    ax.set_xlabel("control step")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+    for boundary in range(chunk_len, scores.shape[0], chunk_len):
+        ax.axvline(boundary + 0.5, color="0.7", linewidth=0.6)
+    fig.suptitle("Cumulative score without time cost (vertical lines are chunk boundaries)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
 def _write_summary(path: Path, summary: dict) -> None:
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -311,16 +435,22 @@ def main() -> int:
     from rlinf.envs.robodojo.robodojo_env import RoboDojoEnv
     from rlinf.models.embodiment.opendm_dm05 import get_model
 
+    config_name = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "robodojo_insert_key_ppo_opendm_dm05_1gpu"
+    )
+    cfg = _load_train_cfg(config_name, sys.argv[2:])
+    task_name = str(cfg.env.train.task_config.task_name)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = RLINF / "logs" / "probe_episode" / stamp
+    out = RLINF / "logs" / "probe_episode" / f"{task_name}_{stamp}"
     model_input_dir = out / "model_inputs"
     image_dir = out / "images"
     model_input_dir.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
     os.environ["ROBODOJO_WORKER_LOG_DIR"] = str(out)
+    print(f"[probe] config={config_name} task={task_name}", flush=True)
     print(f"[probe] output={out}", flush=True)
-
-    cfg = _load_train_cfg()
     env_cfg = cfg.env.train
     chunk_len = int(cfg.actor.model.num_action_chunks)
     print("[probe] starting one Isaac env", flush=True)
@@ -350,13 +480,25 @@ def main() -> int:
     states = [state]
     action_chunks: list[np.ndarray] = []
     chunk_rows: list[dict] = []
+    action_rewards: list[float] = []
+    score_trace: list[float] = []
+    dense_phi: list[float] = []
+    chunk_spans: list[tuple[int, int, float | None]] = []
     success_at = None
     executed = 0
+    episode_return = 0.0
+    stopped = "horizon"
 
     video_path = out / "execution.mp4"
     writer = imageio.get_writer(video_path, fps=10)
     try:
-        writer.append_data(_panel(head, left, right, "t=0 model input, before any action"))
+        opening = _panel(head, left, right, "t=0 before any action")
+        writer.append_data(
+            _compose_frame(
+                opening,
+                _reward_strip(opening.shape[1], horizon, [], [], 0, None),
+            )
+        )
         _save_rgb(image_dir / "step_0000_head.jpg", head)
         _save_rgb(image_dir / "step_0000_left_wrist.jpg", left)
         _save_rgb(image_dir / "step_0000_right_wrist.jpg", right)
@@ -377,13 +519,18 @@ def main() -> int:
             state_before = state.copy()
             chunk_states = [state_before]
             chunk_success = False
+            chunk_start = executed
+            score_before = _tensor_float(env.prev_step_reward)
+            return_before = episode_return
+            chunk_action_rewards: list[float] = []
             print(
                 f"[probe] chunk {chunk_index} predict shape={chunk.shape} "
-                f"denoise_step={denoise_step} step {executed}/{horizon}",
+                f"denoise_step={denoise_step} step {executed}/{horizon} "
+                f"score_before={score_before:.4f}",
                 flush=True,
             )
             for index in range(chunk.shape[0]):
-                obs_list, _rewards, _terms, _truncs, infos_list = env.chunk_step(
+                obs_list, rewards, terms, truncs, infos_list = env.chunk_step(
                     chunk[index][None, None, :]
                 )
                 infos = infos_list[-1] if infos_list else {}
@@ -392,45 +539,75 @@ def main() -> int:
                 states.append(state)
                 chunk_states.append(state)
                 executed += 1
+                delta = _tensor_float(rewards)
+                phi = _info_float(infos, "dense_progress")
+                score_now = _tensor_float(env.prev_step_reward)
+                action_rewards.append(delta)
+                chunk_action_rewards.append(delta)
+                score_trace.append(score_now)
+                dense_phi.append(phi if phi is not None else float("nan"))
+                episode_return += delta
+                chunk_gain = float(sum(chunk_action_rewards))
                 if _info_flag(infos, "success"):
                     chunk_success = True
                     if success_at is None:
                         success_at = executed
-                jump = (
-                    float(np.abs(chunk[index] - chunk[index - 1]).max())
-                    if index
-                    else float(np.abs(chunk[index] - state_before).max())
+                done = _info_flag({"terminated": terms}, "terminated") or _info_flag(
+                    {"truncated": truncs}, "truncated"
+                )
+                cameras = _panel(
+                    head,
+                    left,
+                    right,
+                    f"chunk {chunk_index:02d}  action {index:02d}/{chunk.shape[0] - 1:02d}  t={executed}",
                 )
                 writer.append_data(
-                    _panel(
-                        head,
-                        left,
-                        right,
-                        f"chunk {chunk_index:02d} action {index:02d}  "
-                        f"t={executed}  max|jump|={jump:.3f}",
+                    _compose_frame(
+                        cameras,
+                        _reward_strip(
+                            cameras.shape[1],
+                            horizon,
+                            score_trace,
+                            chunk_spans + [(chunk_start, executed, chunk_gain)],
+                            executed,
+                            phi,
+                        ),
                     )
                 )
                 step_name = f"step_{executed:04d}"
                 _save_rgb(image_dir / f"{step_name}_head.jpg", head)
                 _save_rgb(image_dir / f"{step_name}_left_wrist.jpg", left)
                 _save_rgb(image_dir / f"{step_name}_right_wrist.jpg", right)
-            metrics = _chunk_metrics(chunk, np.stack(chunk_states, axis=0))
+                if done:
+                    stopped = "done"
+                    break
+            score_after = _tensor_float(env.prev_step_reward)
+            chunk_gain = float(sum(chunk_action_rewards))
+            chunk_spans.append((chunk_start, executed, chunk_gain))
+            metrics = _chunk_metrics(chunk[: len(chunk_action_rewards)], np.stack(chunk_states, axis=0))
             metrics.update(
                 {
                     "chunk_index": chunk_index,
-                    "start_step": executed - int(chunk.shape[0]),
-                    "num_actions": int(chunk.shape[0]),
+                    "start_step": chunk_start,
+                    "end_step": executed,
+                    "num_actions": int(len(chunk_action_rewards)),
                     "denoise_step_with_sde_noise": denoise_step,
                     "env_success_during_chunk": chunk_success,
+                    "score_before": score_before,
+                    "score_after": score_after,
+                    "score_gain": score_after - score_before,
+                    "return_before": return_before,
+                    "return_after": episode_return,
+                    "chunk_reward_gain": chunk_gain,
+                    "phi_before": dense_phi[chunk_start - 1] if chunk_start else None,
+                    "phi_after": dense_phi[executed - 1] if executed else None,
                 }
             )
             chunk_rows.append(metrics)
-            action_chunks.append(chunk)
+            action_chunks.append(chunk[: len(chunk_action_rewards)])
             print(
-                f"[probe] chunk {chunk_index} kind={metrics['kind']} "
-                f"jump={metrics['max_arm_command_jump_rad']:.3f} "
-                f"boundary={metrics['boundary_snap_rad']:.3f} "
-                f"follow={metrics['max_arm_state_after_vs_command_rad']:.3f}",
+                f"[probe] chunk {chunk_index} reward {score_before:.4f} -> {score_after:.4f} "
+                f"gain={chunk_gain:+.4f} phi={metrics['phi_after']}",
                 flush=True,
             )
             np.savez_compressed(
@@ -439,22 +616,43 @@ def main() -> int:
                 chunk_lengths=np.array([c.shape[0] for c in action_chunks]),
                 joint_names=np.array(JOINT_NAMES),
                 measured_states=np.stack(states, axis=0),
+                dense_phi=np.asarray(dense_phi, dtype=np.float32),
+                action_reward=np.asarray(action_rewards, dtype=np.float32),
+                score_without_time=np.asarray(score_trace, dtype=np.float32),
             )
             chunk_index += 1
+            if stopped == "done":
+                break
     finally:
         writer.close()
 
-    summary = _summarize(chunk_rows)
+    summary = _summarize(chunk_rows) if chunk_rows else {"cause": "empty", "note": "", "chunks": []}
+    summary["config"] = config_name
+    summary["task"] = task_name
     summary["horizon"] = horizon
     summary["executed_steps"] = executed
+    summary["stopped"] = stopped
     summary["success_step"] = success_at
-    _write_summary(out / "summary.json", summary)
-    _plot_episode(
-        out / "action_vs_state.png",
-        np.concatenate(action_chunks, axis=0),
-        np.stack(states, axis=0),
-        chunk_len,
+    summary["episode_return"] = episode_return
+    summary["reward_meaning"] = (
+        "The video curve and score_without_time are env.prev_step_reward: "
+        "shaping_coef * dense phi, or the success score, with no time cost. "
+        "action_reward is still the training step reward, that change minus time_cost."
     )
+    _write_summary(out / "summary.json", summary)
+    if action_chunks:
+        _plot_episode(
+            out / "action_vs_state.png",
+            np.concatenate(action_chunks, axis=0),
+            np.stack(states, axis=0),
+            chunk_len,
+        )
+        _plot_rewards(
+            out / "reward_trace.png",
+            np.asarray(score_trace, dtype=np.float32),
+            np.asarray(dense_phi, dtype=np.float32),
+            chunk_len,
+        )
     env.offload()
     print(f"[probe] cause={summary['cause']}", flush=True)
     print(summary["note"], flush=True)

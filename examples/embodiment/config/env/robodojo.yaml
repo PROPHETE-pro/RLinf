@@ -6,8 +6,16 @@ ignore_terminations: False
 
 reward_coef: 1.0
 use_dense_reward: False
+dense_shaping_coef: 0.5
+dense_success_reward: 1.0
 use_custom_reward: True
 use_rel_reward: False
+# null keeps the task-file step limit. A train config may set a longer rollout.
+official_step_lim: null
+rollout_step_lim: null
+success_deadline_mode: hard
+success_decay_steps: 525
+time_cost_per_step: 0.0
 center_crop: False
 
 seed: 0

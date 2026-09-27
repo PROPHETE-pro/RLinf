@@ -886,7 +886,14 @@ class FSDPActor(FSDPModelManager, Worker):
 
             def normalize_advantages(batch: dict[str, torch.Tensor]):
                 mask = batch["response_mask"][:, -self.response_len :]
-                batch["advantages"] = masked_normalization(batch["advantages"], mask)
+                advantages = batch["advantages"]
+                if (
+                    mask.ndim == advantages.ndim
+                    and mask.shape[-1] == 1
+                    and advantages.shape[-1] != 1
+                ):
+                    mask = mask.expand_as(advantages)
+                batch["advantages"] = masked_normalization(advantages, mask)
                 return batch
 
             train_batch_iterator.register_global_batch_handler(normalize_advantages)
@@ -1335,6 +1342,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
+        if bool(self.cfg.algorithm.get("intra_chunk_advantage", False)):
+            from rlinf.envs.robodojo.reward import reallocate_chunk_advantages
+
+            rewards = self.rollout_batch["rewards"]
+            advantages = self.rollout_batch["advantages"]
+            if rewards.ndim == 3 and advantages.ndim == 3 and rewards.shape[-1] > 1:
+                self.rollout_batch["advantages"] = reallocate_chunk_advantages(
+                    advantages, rewards
+                )
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:

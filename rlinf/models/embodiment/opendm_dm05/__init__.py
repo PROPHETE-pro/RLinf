@@ -69,6 +69,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         config.add_value_head = cfg.get("add_value_head", True)
         config.noise_level = opendm_cfg.get("noise_level", 0.5)
         config.noise_method = opendm_cfg.get("noise_method", "flow_sde")
+        config.ignore_last = bool(opendm_cfg.get("ignore_last", False))
         config.sample_sde_in_eval = bool(
             opendm_cfg.get("sample_sde_in_eval", False)
         )
