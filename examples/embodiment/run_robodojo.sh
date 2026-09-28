@@ -85,6 +85,7 @@ Examples:
   bash examples/embodiment/run_robodojo.sh robodojo_stack_bowls_ppo_opendm_dm05 \
     env.train.task_config.task_name=hang_mugs env.train.max_episode_steps=800
   bash examples/embodiment/run_robodojo.sh --worker-smoke
+  bash examples/embodiment/run_robodojo.sh --multi-env-smoke
   bash examples/embodiment/run_robodojo.sh --doctor
   bash examples/embodiment/run_robodojo.sh robodojo_stack_bowls_ppo_opendm_dm05 \
     runner.max_epochs=1
@@ -134,6 +135,54 @@ if [[ "${CONFIG_NAME}" == "--worker-smoke" ]]; then
     --headless \
     --enable_cameras \
     --steps "${ROBODOJO_SMOKE_STEPS:-1}"
+fi
+
+if [[ "${CONFIG_NAME}" == "--multi-env-smoke" ]]; then
+  echo "ROBODOJO_PYTHON=${ROBODOJO_PYTHON}"
+  echo "ROBODOJO_PATH=${ROBODOJO_PATH}"
+  echo "ROBODOJO_SMOKE_N_ENVS=${ROBODOJO_SMOKE_N_ENVS:-2}"
+  echo "ROBODOJO_SMOKE_TASK=${ROBODOJO_SMOKE_TASK:-build_tower}"
+  export LD_LIBRARY_PATH="${ROBODOJO_RUNTIME_LIBS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+  export ROBODOJO_ISAAC_CACHE="${ROBODOJO_ISAAC_CACHE:-/tmp/robodojo_isaac_cache}"
+  mkdir -p "${ROBODOJO_ISAAC_CACHE}"
+  exec python3 -u - <<'PY'
+import os
+
+import numpy as np
+
+from rlinf.envs.robodojo.subproc_vector_env import SubprocVectorEnv
+
+n_envs = int(os.environ.get("ROBODOJO_SMOKE_N_ENVS", "2"))
+task = os.environ.get("ROBODOJO_SMOKE_TASK", "build_tower")
+venv = SubprocVectorEnv(
+    task_config={"task_name": task, "action_type": "joint"},
+    n_envs=n_envs,
+    env_seeds=list(range(n_envs)),
+    isaac_python=os.environ["ROBODOJO_PYTHON"],
+    robodojo_path=os.environ["ROBODOJO_PATH"],
+    extra_env={
+        "ROBODOJO_LAYOUT_MODE": "procedural",
+        "ROBODOJO_SAVE_VIDEO": "0",
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+    },
+    rollout_step_lim=50,
+    ready_timeout_sec=1800,
+)
+print(f"[smoke] {n_envs} Isaac workers ready task={task}", flush=True)
+venv.reset()
+obs = venv.get_obs()
+print(
+    f"[smoke] reset ok n={len(obs)} image={obs[0]['full_image'].shape} "
+    f"state={obs[0]['state'].shape}",
+    flush=True,
+)
+actions = np.stack([np.asarray(item["state"], dtype=np.float32) for item in obs])
+venv.step(actions)
+print("[smoke] step ok", flush=True)
+venv.close()
+print("[smoke] PASS", flush=True)
+PY
 fi
 
 shift || true

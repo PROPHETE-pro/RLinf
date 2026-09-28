@@ -113,6 +113,24 @@ def _drop_child_env_var(key: str, value: str) -> bool:
     return False
 
 
+def _nvidia_vulkan_icd() -> Optional[str]:
+    """Pick a single NVIDIA ICD so Kit does not see duplicate Vulkan drivers."""
+    configured = os.environ.get("VK_ICD_FILENAMES") or os.environ.get("VK_DRIVER_FILES")
+    candidates = []
+    if configured:
+        candidates.extend(part for part in configured.split(os.pathsep) if part)
+    candidates.extend(
+        [
+            "/etc/vulkan/icd.d/nvidia_icd.json",
+            "/usr/share/vulkan/icd.d/nvidia_icd.json",
+        ]
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _child_env(robodojo_path: str, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
     env = {
         key: value
@@ -123,6 +141,12 @@ def _child_env(robodojo_path: str, extra: Optional[dict[str, str]] = None) -> di
     env["OMNI_KIT_ACCEPT_EULA"] = env.get("OMNI_KIT_ACCEPT_EULA", "YES")
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
+    icd = _nvidia_vulkan_icd()
+    if icd:
+        # Training images can ship several ICDs for the same A800. Kit then
+        # skips the GPU ("CUDA being in bad state") and the first render hangs.
+        env["VK_ICD_FILENAMES"] = icd
+        env["VK_DRIVER_FILES"] = icd
     xpolicy = os.path.join(robodojo_path, "XPolicyLab")
     env["PYTHONPATH"] = os.pathsep.join([robodojo_path, xpolicy])
     if extra:
@@ -140,7 +164,28 @@ def _child_env(robodojo_path: str, extra: Optional[dict[str, str]] = None) -> di
                 [robodojo_path, xpolicy, extra_pp]
             )
     env.pop("LD_PRELOAD", None)
+    # Ray isolates each EnvWorker with CUDA_VISIBLE_DEVICES, but Vulkan still
+    # enumerates every GPU mounted in the container. Kit then skips those
+    # "hidden" A800s ("CUDA being in bad state") and never creates a render
+    # device, so the first camera read crashes. Drop the mask and pin the
+    # sim with --device cuda:N instead (see ROBODOJO_ISAAC_DEVICE).
+    env["ROBODOJO_ISAAC_DEVICE"] = str(_cuda_visible_index(env.get("CUDA_VISIBLE_DEVICES")))
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     return env
+
+
+def _cuda_visible_index(raw: Optional[str]) -> int:
+    """First CUDA index in a Ray-style CUDA_VISIBLE_DEVICES value."""
+    if not raw:
+        return 0
+    first = raw.split(",")[0].strip()
+    if not first or first.lower() == "none":
+        return 0
+    try:
+        index = int(first)
+    except ValueError:
+        return 0
+    return index if index >= 0 else 0
 
 
 def _open_worker_log(env_id: int) -> tuple[str, Any]:
@@ -237,14 +282,23 @@ class IsaacSubEnvWorker:
         layout_mode = str(self.extra_env.get("ROBODOJO_LAYOUT_MODE") or "").strip()
         if layout_mode:
             cmd.extend(["--layout_mode", layout_mode])
+        child_env = _child_env(self.robodojo_path, self.extra_env)
+        device_index = child_env.get("ROBODOJO_ISAAC_DEVICE", "0")
+        # Do not pass --device here. AppLauncher.add_app_launcher_args calls
+        # parse_known_args before --device exists, and argparse then treats
+        # --device as an abbreviation of --device_id.
+        cmd[cmd.index("--device_id") + 1] = device_index
         self._log_path, self._log_file = _open_worker_log(self.env_id)
         logger.info(
-            "RoboDojo SubEnv %s isaac_worker log: %s", self.env_id, self._log_path
+            "RoboDojo SubEnv %s isaac_worker log: %s device=cuda:%s",
+            self.env_id,
+            self._log_path,
+            device_index,
         )
         self.process = subprocess.Popen(
             cmd,
             cwd=self.robodojo_path,
-            env=_child_env(self.robodojo_path, self.extra_env),
+            env=child_env,
             stdout=self._log_file,
             stderr=self._log_file,
         )

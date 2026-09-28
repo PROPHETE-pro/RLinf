@@ -42,6 +42,18 @@ def test_child_env_drops_k8s_and_stdbuf_preload(monkeypatch):
     assert env["PYTHONPATH"].startswith("/tmp/robodojo")
 
 
+def test_child_env_drops_cuda_mask_and_records_device(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    env = _child_env("/tmp/robodojo")
+    assert "CUDA_VISIBLE_DEVICES" not in env
+    assert env["ROBODOJO_ISAAC_DEVICE"] == "1"
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    env = _child_env("/tmp/robodojo", extra={"CUDA_VISIBLE_DEVICES": "0"})
+    assert "CUDA_VISIBLE_DEVICES" not in env
+    assert env["ROBODOJO_ISAAC_DEVICE"] == "0"
+
+
 def test_child_env_extra_cannot_reintroduce_ld_preload():
     env = _child_env(
         "/tmp/robodojo",

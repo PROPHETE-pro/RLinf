@@ -493,6 +493,48 @@ def parse_args(argv: Optional[list[str]] = None):
     return args
 
 
+def _prepare_isaac_runtime(args) -> None:
+    """Keep headless multi-env Isaac off the shared Kit cache and extra GPUs.
+
+    Portable Kit stores ``nv_shadercache`` inside the Isaac Sim install. On this
+    tree that directory sits on kpfs and is already past the driver cap (4 GB),
+    so every process recompiles the first camera frame until reset times out.
+    ``multi_gpu`` also enumerates A800s hidden by ``CUDA_VISIBLE_DEVICES`` and
+    marks them "CUDA being in bad state".
+    """
+    cache_root = os.environ.get("ROBODOJO_ISAAC_CACHE", "/tmp/robodojo_isaac_cache")
+    # One driver cache per GPU. A shared cache hits the 4 GB driver cap
+    # (logs/20260927-17:41:12: 3964/4000 MB) and every later process recompiles
+    # until reset never arrives.
+    device_id = int(args.device_id)
+    cache_root = os.path.join(cache_root, f"gpu{device_id}")
+    shader_cache = os.path.join(cache_root, "shadercache")
+    driver_cache = os.path.join(cache_root, "nv_shadercache")
+    os.makedirs(shader_cache, exist_ok=True)
+    os.makedirs(driver_cache, exist_ok=True)
+    args.multi_gpu = False
+    # CUDA_VISIBLE_DEVICES is stripped before spawn so Vulkan and CUDA see the
+    # same GPUs. Pin Kit to the index Ray assigned (argv --device_id).
+    args.device = f"cuda:{device_id}"
+    # A800 has no DLSS or OptiX denoiser. Those defaults stall the first render.
+    args.anti_aliasing = 0
+    args.denoiser = False
+    extra = " ".join(
+        [
+            "--/renderer/multiGpu/enabled=False",
+            f"--/rtx/shaderDb/shaderCachePath={shader_cache}",
+            f"--/rtx/shaderDb/driverShaderCachePath={driver_cache}",
+            "--/app/hangDetector/enabled=false",
+            "--/crashreporter/gatherUserStory=0",
+        ]
+    )
+    args.kit_args = f"{getattr(args, 'kit_args', '') or ''} {extra}".strip()
+    print(
+        f"[isaac_worker] local shader cache={driver_cache} multi_gpu=False",
+        flush=True,
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
     os.environ.setdefault("ROBODOJO_RUN_ID", "rlinf-rl")
@@ -508,6 +550,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.path.insert(1, xpolicy)
 
     args = parse_args(argv)
+    _prepare_isaac_runtime(args)
     from isaaclab.app import AppLauncher
 
     app_launcher = AppLauncher(args)
