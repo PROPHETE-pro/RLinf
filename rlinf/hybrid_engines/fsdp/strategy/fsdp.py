@@ -218,11 +218,8 @@ class FSDPStrategy(FSDPStrategyBase):
         """
         for handle in self._iter_fsdp_handles(model):
             flat_param = handle.flat_param
-
-            if hasattr(flat_param, "_local_shard"):
-                flat_param._local_shard = self._move_tensor(
-                    flat_param._local_shard, "cpu"
-                )
+            # ``_local_shard`` is aliased back onto ``.data`` below. Moving it
+            # first allocates a second full copy and then drops it.
             flat_param.data = self._move_tensor(flat_param.data, "cpu")
             if hasattr(flat_param, "_local_shard") and flat_param.data is not None:
                 flat_param._local_shard = flat_param.data
@@ -266,13 +263,12 @@ class FSDPStrategy(FSDPStrategyBase):
             - onload_grad (bool): Whether to load gradients or not.
 
         """
+        # Step 1 leaves the caching allocator fragmented. A later onload asks
+        # for one contiguous flat param (~9 GiB) and fails even when the
+        # reserved-but-unused cache plus free memory would cover a single copy.
+        clear_memory()
         for handle in self._iter_fsdp_handles(model):
             flat_param = handle.flat_param
-
-            if hasattr(flat_param, "_local_shard"):
-                flat_param._local_shard = self._move_tensor(
-                    flat_param._local_shard, device
-                )
             flat_param.data = self._move_tensor(flat_param.data, device)
             if hasattr(flat_param, "_local_shard") and flat_param.data is not None:
                 flat_param._local_shard = flat_param.data

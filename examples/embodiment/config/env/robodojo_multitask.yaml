@@ -6,6 +6,7 @@ ignore_terminations: False
 
 reward_coef: 1.0
 use_dense_reward: False
+dense_shaping_coef: 0.7
 use_custom_reward: True
 use_rel_reward: False
 center_crop: False

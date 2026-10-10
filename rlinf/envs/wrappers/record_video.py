@@ -306,6 +306,64 @@ class RecordVideo(gym.Wrapper):
             value = value[part]
         return value
 
+    def _at_time(self, value: Any, time_idx: Optional[int]) -> Any:
+        """Pick one timestep. A trailing policy frame reuses the last reward."""
+        if time_idx is None or not isinstance(value, (np.ndarray, list, tuple)):
+            return value
+        length = len(value)
+        if length == 0:
+            return None
+        return value[min(int(time_idx), length - 1)]
+
+    def _as_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            value = value.reshape(-1)[-1]
+        elif isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return None
+            value = value[-1]
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_bool(self, value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            value = value.reshape(-1)[-1]
+        elif isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return None
+            value = value[-1]
+        try:
+            return bool(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _append_compatible_frame(self, image: np.ndarray) -> None:
+        """Keep one frame size in the MP4.
+
+        The reset image and the final policy observation are the raw head camera.
+        Action frames are taller because the dense-reward strip is stacked underneath.
+        """
+        if not self.render_images:
+            self.render_images.append(image)
+            return
+        current = self.render_images[0].shape
+        if image.shape == current:
+            self.render_images.append(image)
+            return
+        if image.shape[0] > current[0]:
+            self.render_images.clear()
+            self.render_images.append(image)
+
     def _build_info_item(
         self,
         infos: Optional[Any],
@@ -318,18 +376,16 @@ class RecordVideo(gym.Wrapper):
         info_item: dict[str, Any] = {}
 
         if rewards is not None:
-            value = self._value_for_env(rewards, env_id)
-            if time_idx is not None and isinstance(value, (np.ndarray, list, tuple)):
-                if len(value) > time_idx:
-                    value = value[time_idx]
-            info_item["reward"] = float(value) if value is not None else value
+            value = self._at_time(self._value_for_env(rewards, env_id), time_idx)
+            reward = self._as_float(value)
+            if reward is not None:
+                info_item["reward"] = reward
 
         if terminations is not None:
-            value = self._value_for_env(terminations, env_id)
-            if time_idx is not None and isinstance(value, (np.ndarray, list, tuple)):
-                if len(value) > time_idx:
-                    value = value[time_idx]
-            info_item["termination"] = bool(value) if value is not None else value
+            value = self._at_time(self._value_for_env(terminations, env_id), time_idx)
+            termination = self._as_bool(value)
+            if termination is not None:
+                info_item["termination"] = termination
 
         if infos is not None:
             for key in self._get_video_info_keys():
@@ -375,9 +431,9 @@ class RecordVideo(gym.Wrapper):
         if len(images) > 1:
             nrows = int(np.sqrt(len(images)))
             full_image = tile_images(images, nrows=nrows)
-            self.render_images.append(full_image)
         else:
-            self.render_images.append(images[0])
+            full_image = images[0]
+        self._append_compatible_frame(full_image)
 
     def add_new_frames(
         self,

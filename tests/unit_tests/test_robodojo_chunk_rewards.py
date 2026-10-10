@@ -132,3 +132,17 @@ def test_time_cost_scales_with_executed_steps():
     full = chunk_reward_from_cumulative(0.0, 0.0, TIME_COST, 50)
     short = chunk_reward_from_cumulative(0.0, 0.0, TIME_COST, 10)
     assert math.isclose(full, 5 * short)
+
+
+def test_record_metrics_reports_reward_without_time_cost():
+    env = RoboDojoEnv.__new__(RoboDojoEnv)
+    env.returns = torch.tensor([-0.38])
+    env.time_cost_per_step = TIME_COST
+    env._elapsed_steps = torch.tensor([1000])
+    env.task_ids_tensor = torch.zeros(1)
+    infos = env._record_metrics(torch.tensor([-0.02]), {})
+    episode = infos["episode"]
+    assert math.isclose(float(episode["return"]), -0.4, abs_tol=1e-5)
+    assert math.isclose(float(episode["reward"]), -TIME_COST, abs_tol=1e-8)
+    assert math.isclose(float(episode["return_no_time"]), 0.0, abs_tol=1e-5)
+    assert math.isclose(float(episode["reward_no_time"]), 0.0, abs_tol=1e-8)

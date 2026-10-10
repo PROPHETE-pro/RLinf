@@ -1356,7 +1356,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
-        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        time_cost_per_step = float(
+            OmegaConf.select(self.cfg, "env.train.time_cost_per_step", default=0.0)
+            or 0.0
+        )
+        rollout_metrics = compute_rollout_metrics(
+            self.rollout_batch, time_cost_per_step=time_cost_per_step
+        )
         log_progress(
             "Actor",
             f"rank={self._rank} compute_advantages_and_returns: done",

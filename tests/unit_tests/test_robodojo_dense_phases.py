@@ -25,6 +25,7 @@ def _progress():
         build_tower_groups,
         exp_progress,
         fasten_screws_groups,
+        screw_pair_credit,
         APPROACH_SCALE,
         ball_in_container,
         containment_gap,
@@ -53,6 +54,7 @@ def _progress():
         "build_tower_groups": build_tower_groups,
         "exp_progress": exp_progress,
         "fasten_screws_groups": fasten_screws_groups,
+        "screw_pair_credit": screw_pair_credit,
         "APPROACH_SCALE": APPROACH_SCALE,
         "ball_in_container": ball_in_container,
         "containment_gap": containment_gap,
@@ -272,22 +274,70 @@ def test_poured_balls_count_while_the_cup_is_tilted():
 
 def test_fasten_and_tower_specs_follow_the_phase_split():
     screws = _progress()["fasten_screws_groups"]()
-    assert len(screws) == 3
-    assert screws[0]["phases"][0]["steps"][0]["kind"] == "grasp"
-    assert screws[0]["phases"][0]["steps"][1]["approach"] == _progress()["APPROACH_SCALE"]
-    assert {term["kind"] for term in screws[0]["phases"][0]["state"]} == {"xy", "depth"}
-    depth = next(term for term in screws[0]["phases"][0]["state"] if term["kind"] == "depth")
-    assert depth["footprint"] == 0.001
-    assert screws[0]["phases"][0]["state_gate"][0]["kind"] == "axis_up"
+    assert [group["kind"] for group in screws] == ["screw", "screw", "screw"]
+    assert [group["nut"] for group in screws] == ["nut0", "nut1", "nut2"]
+    assert [group["bolt"] for group in screws] == ["bolt0", "bolt1", "bolt2"]
 
     tower = _progress()["build_tower_groups"]()[0]["phases"]
-    assert [phase["weight"] for phase in tower] == [7, 7, 6, 20, 10, 10, 20, 20]
-    assert tower[3]["requires_previous"] is True
-    assert tower[3]["sets_board"] is True
-    assert tower[3]["steps"][0]["kind"] == "grasp_inset"
-    assert tower[4]["requires_board"] is True
-    assert tower[6]["requires_uppers"] is True
-    assert tower[6]["steps"][0]["label"] == "block7"
+    assert [phase["weight"] for phase in tower] == [10, 10, 20, 10, 10, 20, 20]
+    assert tower[0]["sets_base"] is True
+    assert tower[1]["sets_base"] is True
+    assert tower[2]["requires_bases"] is True
+    assert tower[2]["sets_board"] is True
+    assert tower[2]["steps"][0]["kind"] == "grasp_inset"
+    assert tower[3]["requires_board"] is True
+    assert tower[5]["requires_uppers"] is True
+    assert tower[5]["steps"][0]["label"] == "block7"
+    assert all(term.get("kind") != "xy" or "b_role" not in term for term in tower[2]["state"])
+
+
+def test_screw_credit_ignores_an_empty_close_and_pays_depth_to_12mm():
+    credit = _progress()["screw_pair_credit"]
+    progress = _progress()["exp_progress"]
+    still = np.zeros(3)
+    far_open = credit(
+        dist=0.2, closed=0.0, hand_delta=still, nut_delta=still, xy=0.2, upright_deg=0.0, depth_gap=-0.01
+    )
+    far_closed = credit(
+        dist=0.2, closed=1.0, hand_delta=still, nut_delta=still, xy=0.2, upright_deg=0.0, depth_gap=-0.01
+    )
+    # The hand is not on the nut, so shutting the gripper does not add points.
+    assert far_closed == pytest.approx(far_open)
+    assert far_open == pytest.approx(6.0 * progress(0.2, 0.4))
+    held = credit(
+        dist=0.02,
+        closed=1.0,
+        hand_delta=still,
+        nut_delta=still,
+        xy=0.05,
+        upright_deg=0.0,
+        depth_gap=-0.01,
+    )
+    slipped = credit(
+        dist=0.02,
+        closed=1.0,
+        hand_delta=np.array([0.02, 0.0, 0.0]),
+        nut_delta=still,
+        xy=0.0,
+        upright_deg=0.0,
+        depth_gap=-0.01,
+    )
+    # A slip removes the grasp and the nut-to-bolt alignment, even if the hand stays shut.
+    assert held > slipped
+    assert slipped == pytest.approx(6.0 * progress(0.02, 0.4))
+    nine = credit(
+        dist=0.2, closed=0.0, hand_delta=still, nut_delta=still, xy=0.0, upright_deg=0.0, depth_gap=0.009
+    )
+    full = credit(
+        dist=0.2, closed=0.0, hand_delta=still, nut_delta=still, xy=0.0, upright_deg=0.0, depth_gap=0.012
+    )
+    # Seated nuts keep the first three parts while the hand is open. 9 mm is 9/12 of the drive.
+    assert nine == pytest.approx(6 + 8 + 8 + 11 * 0.75)
+    assert full == pytest.approx(33.0)
+    deeper = credit(
+        dist=0.2, closed=0.0, hand_delta=still, nut_delta=still, xy=0.0, upright_deg=0.0, depth_gap=0.02
+    )
+    assert deeper == pytest.approx(full)
 
 
 def test_one_hand_cannot_pass_and_a_slipping_board_loses_the_grasp():

@@ -89,6 +89,10 @@ Examples:
   bash examples/embodiment/run_robodojo.sh --doctor
   bash examples/embodiment/run_robodojo.sh robodojo_stack_bowls_ppo_opendm_dm05 \
     runner.max_epochs=1
+  # Resume a checkpoint saved after critic warmup:
+  bash examples/embodiment/run_robodojo.sh robodojo_insert_tubes_ppo_opendm_dm05_8gpu \
+    runner.resume_dir=/path/to/checkpoints/global_step_N \
+    actor.optim.skip_critic_warmup=true
 EOF
   exit 0
 fi

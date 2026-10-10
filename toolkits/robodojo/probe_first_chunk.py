@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Roll one RoboDojo env to max_episode_steps with training-style OpenDM chunks.
+"""Roll one RoboDojo env to max_episode_steps with OpenDM chunks.
 
-Matches rollout inference of::
+The default matches training rollout: ``predict_action_batch(mode="train")``,
+which injects flow-SDE noise on one random denoise step. ``--eval`` matches
+evaluation: ``mode="eval"`` integrates the flow ODE, so every denoise step
+uses the predicted mean and a zero standard deviation. The initial latent is
+still one Gaussian draw, the same as ``HuggingFaceWorker.evaluate``.
 
-    bash examples/embodiment/run_robodojo.sh robodojo_build_tower_ppo_opendm_dm05_1gpu
+Usage::
+
+    python toolkits/robodojo/probe_first_chunk.py CONFIG [CKPT] [--eval] [hydra overrides...]
+
+``CKPT`` is optional. Pass a ``global_step_N`` directory (or its
+``full_weights.pt``) to load that actor on top of the config's base model.
+``--eval`` selects the evaluation flow ODE. Without it, sampling stays flow SDE.
+Remaining arguments are Hydra overrides.
 
 Every chunk until ``max_episode_steps`` is kept: the observation sent to the
 model, the denormalized absolute joint chunk, and the three cameras after each
@@ -39,6 +50,78 @@ JOINT_NAMES = [
     "R_grip",
 ]
 ARM_INDEX = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+
+
+def _pop_eval_flag(argv: list[str]) -> tuple[list[str], str]:
+    """Pull ``--eval`` out of argv. Default stays the training flow-SDE path."""
+    kept: list[str] = []
+    evaluate = False
+    for arg in argv:
+        if arg == "--eval":
+            evaluate = True
+            continue
+        kept.append(arg)
+    return kept, "eval" if evaluate else "train"
+
+
+def _sampling_name(mode: str) -> str:
+    return "flow_sde" if mode == "train" else "flow_ode"
+
+
+def _pop_ckpt_arg(argv: list[str]) -> tuple[list[str], str | None]:
+    """Pull a checkpoint path out of argv so Hydra does not see it."""
+    kept: list[str] = []
+    ckpt = None
+    for arg in argv:
+        if ckpt is None and "=" not in arg and not arg.startswith("-"):
+            path = Path(arg)
+            if path.exists():
+                ckpt = str(path)
+                continue
+        kept.append(arg)
+    return kept, ckpt
+
+
+def _resolve_full_weights(ckpt: str) -> Path:
+    path = Path(ckpt)
+    if path.is_file():
+        return path
+    for relative in (
+        Path("actor") / "model_state_dict" / "full_weights.pt",
+        Path("model_state_dict") / "full_weights.pt",
+        Path("full_weights.pt"),
+    ):
+        candidate = path / relative
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"No full_weights.pt under {path}. Expected actor/model_state_dict/full_weights.pt."
+    )
+
+
+def _load_actor_ckpt(model, ckpt: str) -> str:
+    import torch
+
+    weights = _resolve_full_weights(ckpt)
+    print(f"[probe] loading actor checkpoint {weights}", flush=True)
+    state = torch.load(weights, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(
+        f"[probe] actor weights loaded missing={len(missing)} unexpected={len(unexpected)}",
+        flush=True,
+    )
+    if missing:
+        print(f"[probe] missing sample {list(missing)[:8]}", flush=True)
+    if unexpected:
+        print(f"[probe] unexpected sample {list(unexpected)[:8]}", flush=True)
+    if len(missing) > 50 or len(unexpected) > 50:
+        raise RuntimeError(
+            f"Actor checkpoint did not match the model "
+            f"(missing={len(missing)} unexpected={len(unexpected)})."
+        )
+    return str(weights)
 
 
 def _setup_env() -> None:
@@ -321,7 +404,7 @@ def _chunk_metrics(actions: np.ndarray, states: np.ndarray) -> dict:
     }
 
 
-def _summarize(chunks: list[dict]) -> dict:
+def _summarize(chunks: list[dict], rollout_mode: str = "train") -> dict:
     kinds: dict[str, list[int]] = {}
     for row in chunks:
         kinds.setdefault(row["kind"], []).append(int(row["chunk_index"]))
@@ -364,8 +447,8 @@ def _summarize(chunks: list[dict]) -> dict:
         "jitter_chunks": jitter,
         "repeat_chunks": repeat,
         "execution_chunks": execution,
-        "inference_mode": "train",
-        "noise_method": "flow_sde",
+        "inference_mode": rollout_mode,
+        "noise_method": _sampling_name(rollout_mode),
         "action_meaning": "denormalized absolute joint targets sent to the env",
     }
 
@@ -440,16 +523,30 @@ def main() -> int:
         if len(sys.argv) > 1
         else "robodojo_insert_key_ppo_opendm_dm05_1gpu"
     )
-    cfg = _load_train_cfg(config_name, sys.argv[2:])
+    extra_args, rollout_mode = _pop_eval_flag(sys.argv[2:])
+    extra_args, ckpt = _pop_ckpt_arg(extra_args)
+    cfg = _load_train_cfg(config_name, extra_args)
     task_name = str(cfg.env.train.task_config.task_name)
+    layout_seed = int(cfg.env.train.seed)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = RLINF / "logs" / "probe_episode" / f"{task_name}_{stamp}"
+    ckpt_tag = f"_{Path(ckpt).name}" if ckpt else ""
+    sampling = _sampling_name(rollout_mode)
+    out = (
+        RLINF
+        / "logs"
+        / "probe_episode"
+        / f"{task_name}{ckpt_tag}_{sampling}_seed{layout_seed}_{stamp}"
+    )
     model_input_dir = out / "model_inputs"
     image_dir = out / "images"
     model_input_dir.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
     os.environ["ROBODOJO_WORKER_LOG_DIR"] = str(out)
-    print(f"[probe] config={config_name} task={task_name}", flush=True)
+    print(
+        f"[probe] config={config_name} task={task_name} ckpt={ckpt} "
+        f"eval={rollout_mode == 'eval'} sampling={sampling} layout_seed={layout_seed}",
+        flush=True,
+    )
     print(f"[probe] output={out}", flush=True)
     env_cfg = cfg.env.train
     chunk_len = int(cfg.actor.model.num_action_chunks)
@@ -472,6 +569,13 @@ def main() -> int:
 
     print(f"[probe] loading {cfg.actor.model.model_path}", flush=True)
     model = get_model(cfg.actor.model)
+    loaded_ckpt = _load_actor_ckpt(model, ckpt) if ckpt else None
+    if rollout_mode == "eval" and getattr(model.config, "sample_sde_in_eval", False):
+        print(
+            "[probe] sample_sde_in_eval was true; clearing it so eval uses the flow ODE",
+            flush=True,
+        )
+        model.config.sample_sde_in_eval = False
     model = model.to(device="cuda", dtype=torch.bfloat16).eval()
 
     print("[probe] reset, then roll until max_episode_steps", flush=True)
@@ -510,7 +614,7 @@ def main() -> int:
             _save_rgb(model_input_dir / f"chunk_{chunk_index:03d}_right_wrist.png", right)
             with torch.no_grad():
                 actions, result = model.predict_action_batch(
-                    env_obs=obs, mode="train", compute_values=True
+                    env_obs=obs, mode=rollout_mode, compute_values=True
                 )
             chunk = actions[0].detach().float().cpu().numpy().astype(np.float32)
             remain = horizon - executed
@@ -591,6 +695,8 @@ def main() -> int:
                     "start_step": chunk_start,
                     "end_step": executed,
                     "num_actions": int(len(chunk_action_rewards)),
+                    "rollout_mode": rollout_mode,
+                    "sampling": sampling,
                     "denoise_step_with_sde_noise": denoise_step,
                     "env_success_during_chunk": chunk_success,
                     "score_before": score_before,
@@ -626,9 +732,20 @@ def main() -> int:
     finally:
         writer.close()
 
-    summary = _summarize(chunk_rows) if chunk_rows else {"cause": "empty", "note": "", "chunks": []}
+    summary = (
+        _summarize(chunk_rows, rollout_mode)
+        if chunk_rows
+        else {
+            "cause": "empty",
+            "note": "",
+            "chunks": [],
+            "inference_mode": rollout_mode,
+            "noise_method": sampling,
+        }
+    )
     summary["config"] = config_name
     summary["task"] = task_name
+    summary["actor_checkpoint"] = loaded_ckpt
     summary["horizon"] = horizon
     summary["executed_steps"] = executed
     summary["stopped"] = stopped

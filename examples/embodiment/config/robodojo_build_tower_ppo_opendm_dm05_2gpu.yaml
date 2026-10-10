@@ -3,9 +3,9 @@
 # Collocated, with offload so Isaac and the actor do not sit on the GPU
 # at the same time. 8 envs / 2 GPUs = 4 Isaac processes per GPU.
 # rollout_epoch=1 so the first PPO update is reached sooner.
-# rollout/rank = (8*1/2)*(2100/50) = 168. 32 does not divide 168, so
-# micro_batch is 28 and per-rank batch is 84: 168 % 84 = 0.
-# global_batch_size=168, 168 % (28*2) = 0.
+# Short horizon for checking the reward video: 500 steps = 10 chunks.
+# rollout/rank = (8*1/2)*(500/50) = 40. per-rank batch = 40, 40 % 40 = 0.
+# global_batch_size=80, micro_batch_size=10, 80 % (10*2) = 0.
 defaults:
   - env/robodojo@env.train
   - env/robodojo@env.eval
@@ -75,30 +75,31 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  enable_offload: True
+  enable_offload: False
   train:
     rollout_epoch: 1
     total_num_envs: 8
     chunk_step_timeout_sec: 0
     reward_coef: ${algorithm.reward_coef}
-    max_episode_steps: 2100
-    max_steps_per_rollout_epoch: 2100
+    max_episode_steps: 500
+    max_steps_per_rollout_epoch: 500
     group_size: ${algorithm.group_size}
     seed: 0
     layout_mode: procedural
     use_fixed_reset_state_ids: False
     center_crop: False
-    use_dense_reward: False
-    dense_shaping_coef: 0.5
+    use_dense_reward: True
+    dense_shaping_coef: 0.7
     dense_success_reward: 1.0
     use_rel_reward: False
     use_custom_reward: True
     official_step_lim: 1050
-    rollout_step_lim: 2100
+    rollout_step_lim: 500
     success_deadline_mode: hard
     success_decay_steps: 525
     time_cost_per_step: 0.0004
-    enable_offload: True
+    # False keeps Isaac on GPU across the actor update (no cold start; may OOM).
+    enable_offload: False
     auto_task_horizon: True
     video_cfg:
       save_video: True
@@ -113,7 +114,7 @@ env:
     total_num_envs: 8
     auto_reset: True
     ignore_terminations: True
-    use_dense_reward: False
+    use_dense_reward: True
     use_rel_reward: False
     use_custom_reward: True
     max_episode_steps: 1050
@@ -123,7 +124,8 @@ env:
     use_fixed_reset_state_ids: False
     is_eval: True
     layout_mode: eval_json
-    enable_offload: True
+    # False keeps Isaac on GPU across the actor update (no cold start; may OOM).
+    enable_offload: False
     video_cfg:
       save_video: True
       video_stride: -1
@@ -148,12 +150,10 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 28
-  # world_size=2: 168 % (28*2)=0；per-rank batch=84
-  # rollout/rank = (8*1/2)*(2100/50) = 168，168 % 84 = 0
-  # micro 32 does not divide 168, so the update step is slightly smaller
-  # than the 4-epoch config.
-  global_batch_size: 168
+  micro_batch_size: 10
+  # world_size=2: 80 % (10*2)=0；per-rank batch=40
+  # rollout/rank = (8*1/2)*(500/50) = 40，40 % 40 = 0
+  global_batch_size: 80
   seed: 1234
   enable_offload: True
 

@@ -235,6 +235,38 @@ def _read_dense_progress(env) -> Optional[float]:
     return float(value)
 
 
+_HEAD_CAMERA_NAMES = ("cam_head", "cam_high", "cam_third_view")
+
+
+def _head_camera_index(env) -> int:
+    names = env.obs_manager.camera_manager.camera_names[0]
+    for index, name in enumerate(names):
+        if name in _HEAD_CAMERA_NAMES:
+            return index
+    raise KeyError(f"no head camera among {list(names)}")
+
+
+def _as_rgb_uint8(image: Any) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return np.array(arr, copy=True)
+
+
+def _capture_head_rgb(env) -> np.ndarray:
+    """Render and read only the head camera. Wrist annotators stay unread."""
+    env.render()
+    head_idx = _head_camera_index(env)
+    data = env.obs_manager.capture_manager.step(env_ids=[0], cam_ids=[head_idx])
+    cam_data = data[0]
+    frames = cam_data.get("rgb")
+    if not frames:
+        raise KeyError(f"head camera annotators missing rgb; have {list(cam_data)}")
+    return _as_rgb_uint8(frames[0]["data"])
+
+
 def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
     chunk = np.asarray(actions, dtype=np.float32)
     if chunk.ndim == 1:
@@ -242,7 +274,6 @@ def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
     if chunk.ndim != 2 or chunk.shape[-1] != 14:
         raise ValueError(f"expected (H, 14) actions, got {chunk.shape}")
     every = _video_record_every()
-    last_payload = None
     head_frames: list[np.ndarray] = []
     progress_trace: list[float] = []
     for row in chunk:
@@ -252,11 +283,10 @@ def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
         phi = _read_dense_progress(env)
         if phi is not None:
             progress_trace.append(phi)
-        last_payload = _obs_payload(env)
         if every is not None:
-            head_frames.append(np.array(last_payload["full_image"], copy=True))
-    if last_payload is None:
-        last_payload = _obs_payload(env)
+            head_frames.append(_capture_head_rgb(env))
+    # Policy obs is the chunk boundary only. OpenDM does not consume mid-chunk frames.
+    last_payload = _obs_payload(env)
     if progress_trace:
         last_payload = dict(last_payload)
         last_payload["dense_progress"] = progress_trace[-1]
@@ -266,6 +296,26 @@ def _step_chunk(env, actions: np.ndarray) -> dict[str, Any]:
         last_payload = dict(last_payload)
         last_payload["video_frames"] = [head_frames[i] for i in kept]
     return last_payload
+
+
+def _training_render_cfg() -> dict:
+    """Two Isaac contexts per A800 cannot keep the quality RTX path.
+
+    RoboDojo defaults to ``rendering_mode=quality`` and ``antialiasing_mode=DLAA``.
+    Those fields are written after the rendering preset, so the preset's
+    denoiser flags are turned back on. NRD then runs out of descriptor sets,
+    the render never returns, and the parent respawns the worker.
+    """
+    return {
+        "rendering_mode": "performance",
+        "antialiasing_mode": "Off",
+        "enable_dl_denoiser": False,
+        "enable_dlssg": False,
+        "dlss_mode": 0,
+        "enable_translucency": False,
+        "enable_reflections": False,
+        "enable_global_illumination": False,
+    }
 
 
 def _build_env(args_cli):
@@ -386,6 +436,12 @@ def _build_env(args_cli):
         force_add=True,
     )
     env_cfg.sim.seed = [int(args_cli.seed)]
+    for key, value in _training_render_cfg().items():
+        OmegaConf.update(env_cfg, f"render.{key}", value, force_add=True)
+    print(
+        "[isaac_worker] render=performance antialiasing=Off dl_denoiser=False",
+        flush=True,
+    )
 
     simulation_app = args_cli._simulation_app
     env = create_eval_env(env_cfg, app=simulation_app)
@@ -516,7 +572,8 @@ def _prepare_isaac_runtime(args) -> None:
     # CUDA_VISIBLE_DEVICES is stripped before spawn so Vulkan and CUDA see the
     # same GPUs. Pin Kit to the index Ray assigned (argv --device_id).
     args.device = f"cuda:{device_id}"
-    # A800 has no DLSS or OptiX denoiser. Those defaults stall the first render.
+    # AppLauncher accepts these flags but does not write the carb settings.
+    # The settings that actually reach Kit are env_cfg.render in _build_env.
     args.anti_aliasing = 0
     args.denoiser = False
     extra = " ".join(

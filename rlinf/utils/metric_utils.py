@@ -348,7 +348,9 @@ def compute_evaluate_metrics(eval_metrics_list):
     return all_eval_metrics
 
 
-def compute_rollout_metrics(data_buffer: dict) -> dict:
+def compute_rollout_metrics(
+    data_buffer: dict, time_cost_per_step: float = 0.0
+) -> dict:
     rollout_metrics = {}
     loss_mask = data_buffer.get("loss_mask", None)
 
@@ -404,6 +406,14 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         rewards_metrics = {
             "rewards": mean_rewards,
         }
+        # Each control step is one buffer cell, and the env subtracts
+        # ``time_cost_per_step`` once per cell (spread across the chunk, or
+        # lumped onto the last cell). Adding the constant back recovers the
+        # per-step task reward.
+        if time_cost_per_step:
+            rewards_metrics["rewards_no_time"] = mean_rewards + float(
+                time_cost_per_step
+            )
         rollout_metrics.update(rewards_metrics)
 
     if "advantages" in data_buffer:

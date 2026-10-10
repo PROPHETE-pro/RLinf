@@ -70,6 +70,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         config.noise_level = opendm_cfg.get("noise_level", 0.5)
         config.noise_method = opendm_cfg.get("noise_method", "flow_sde")
         config.ignore_last = bool(opendm_cfg.get("ignore_last", False))
+        config.is_history = bool(opendm_cfg.get("is_history", False))
+        config.history_slots = int(opendm_cfg.get("history_slots", 20))
         config.sample_sde_in_eval = bool(
             opendm_cfg.get("sample_sde_in_eval", False)
         )
@@ -163,7 +165,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             max_length=config.max_length,
             image_prompts=config.image_prompts,
             add_state=config.add_state,
-            is_history=False,
+            is_history=config.is_history,
             enable_logging=False,
         )
         model.pixel_transform = PixelTransform(

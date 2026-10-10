@@ -99,6 +99,7 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         self.add_state = getattr(config, "add_state", True)
         self.default_speed = str(getattr(config, "default_speed", "0.5"))
         self.default_control_mode = getattr(config, "default_control_mode", None)
+        self._history_frames: list[list[Image.Image]] = []
 
         for name, module in self.named_modules():
             path_parts = name.split(".")
@@ -137,6 +138,65 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         )
         action_mask[..., : self.config.action_env_dim] = 1.0
         return action_mask
+
+    def _use_history(self) -> bool:
+        return bool(getattr(self.config, "is_history", False))
+
+    def _history_slot_count(self) -> int:
+        return max(1, int(getattr(self.config, "history_slots", 20)))
+
+    def _consume_history(self, env_obs) -> list[list[Image.Image]]:
+        """Past head frames for this observation, then store the current one.
+
+        A frame becomes visible on the next replan. Episode step 0 clears the
+        buffer, matching a fresh official-eval history.
+        """
+        main = env_obs["main_images"]
+        batch = int(main.shape[0]) if torch.is_tensor(main) else len(main)
+        if len(self._history_frames) != batch:
+            self._history_frames = [[] for _ in range(batch)]
+        elapsed = env_obs.get("elapsed_steps")
+        slots = self._history_slot_count()
+        histories: list[list[Image.Image]] = []
+        for index in range(batch):
+            step = 0 if elapsed is None else int(elapsed[index])
+            if step == 0:
+                self._history_frames[index] = []
+            kept = list(self._history_frames[index][-slots:])
+            histories.append(kept)
+            if kept and not getattr(self, "_history_logged", False):
+                self._history_logged = True
+                print(
+                    f"[history] feeding {len(kept)} head frame(s) at elapsed_step={step}",
+                    flush=True,
+                )
+            self._history_frames[index].append(self._tensor_to_pil(main[index]))
+            if len(self._history_frames[index]) > slots:
+                self._history_frames[index] = self._history_frames[index][-slots:]
+        return histories
+
+    @staticmethod
+    def _flatten_history_pixels(pixels, mask):
+        """Keep one image per real history slot, in batch order.
+
+        ``pixels`` is padded to a fixed slot count so rollout steps can be
+        stacked. ``mask`` marks the ``<unused0>`` tokens of the real slots.
+        """
+        if pixels is None or mask is None:
+            return None
+        if pixels.dim() == 4:
+            pixels = pixels.unsqueeze(0)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        tokens_per_image = 16
+        chosen = []
+        for index in range(pixels.shape[0]):
+            count = int(mask[index].sum().item()) // tokens_per_image
+            if count > 0:
+                chosen.append(pixels[index, :count])
+        if not chosen:
+            return None
+        return torch.cat(chosen, dim=0)
 
     def obs_processor(self, env_obs):
         processed_obs = {
@@ -320,7 +380,7 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             token_type_ids.append(tti)
             pixel_values.append(self._as_per_sample_pixels(item["pixel_values"]))
 
-        return {
+        stacked = {
             "input_ids": torch.cat(input_ids, dim=0),
             "attention_mask": torch.cat(attention_mask, dim=0),
             "token_type_ids": torch.cat(token_type_ids, dim=0),
@@ -328,6 +388,33 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             # Flatten to [B * N, C, H, W] only when calling the VLM.
             "pixel_values": torch.stack(pixel_values, dim=0),
         }
+        if self._use_history():
+            history_masks = []
+            history_pixels = []
+            for item, ids in zip(tokenized_list, input_ids):
+                history_mask = item.get("history_mask")
+                if history_mask is None:
+                    history_mask = torch.zeros_like(item["input_ids"], dtype=torch.bool)
+                seq_len = history_mask.shape[1]
+                target_len = ids.shape[1]
+                if seq_len > target_len:
+                    history_mask = history_mask[:, :target_len]
+                elif seq_len < target_len:
+                    history_mask = torch.cat(
+                        [
+                            history_mask,
+                            torch.zeros(
+                                (history_mask.shape[0], target_len - seq_len),
+                                dtype=torch.bool,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                history_masks.append(history_mask)
+                history_pixels.append(item["history_pixel_values"])
+            stacked["history_mask"] = torch.cat(history_masks, dim=0)
+            stacked["history_pixel_values"] = torch.stack(history_pixels, dim=0)
+        return stacked
 
     def _tokenize_observations(self, processed_obs: dict) -> dict:
         raw_main = processed_obs["observation/image"]
@@ -339,6 +426,7 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         prompts = self._prompts_as_list(processed_obs.get("prompt", ""), batch_size)
         meta_data = self._meta_data()
 
+        histories = processed_obs.get("history_images")
         tokenized_list = []
         for i in range(batch_size):
             wrist_i = None if raw_wrist is None else raw_wrist[i]
@@ -349,10 +437,43 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
                 "state": states[i],
                 "meta_data": meta_data,
             }
+            if histories is not None:
+                sample["history_images"] = list(histories[i])
             if self.pixel_transform is not None:
                 sample = self.pixel_transform(sample)
-            tokenized_list.append(self.chat_tokenization(sample))
+            tokenized = self.chat_tokenization(sample)
+            if self._use_history():
+                tokenized = self._pad_history_slots(tokenized)
+            tokenized_list.append(tokenized)
         return self._pad_and_stack_tokens(tokenized_list)
+
+    def _pad_history_slots(self, tokenized: dict) -> dict:
+        """Pad history pixels to ``history_slots`` so every chunk stacks."""
+        slots = self._history_slot_count()
+        current = self._as_per_sample_pixels(tokenized["pixel_values"])
+        spatial = tuple(current.shape[-3:])
+        pixels = tokenized.get("history_pixel_values")
+        if pixels is None:
+            pixels = current.new_zeros((slots, *spatial))
+        else:
+            pixels = self._as_per_sample_pixels(pixels)
+            if pixels.shape[0] < slots:
+                pad = pixels.new_zeros((slots - pixels.shape[0], *pixels.shape[1:]))
+                pixels = torch.cat([pixels, pad], dim=0)
+            elif pixels.shape[0] > slots:
+                pixels = pixels[:slots]
+        mask = tokenized.get("history_mask")
+        if mask is None:
+            mask = torch.zeros_like(tokenized["input_ids"], dtype=torch.bool)
+        real_images = int(mask.sum().item()) // 16
+        if real_images > pixels.shape[0]:
+            raise RuntimeError(
+                "History token count does not match history images: "
+                f"tokens={int(mask.sum().item())} images={pixels.shape[0]}"
+            )
+        tokenized["history_pixel_values"] = pixels
+        tokenized["history_mask"] = mask
+        return tokenized
 
     def forward(self, forward_type="default_forward", **kwargs):
         if "forward_inputs" in kwargs and "data" not in kwargs:
@@ -382,6 +503,8 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             chains.to(device=device, dtype=target_dtype),
             denoise_inds.to(device),
             compute_values,
+            history_pixel_values=tokenized.get("history_pixel_values"),
+            history_mask=tokenized.get("history_mask"),
         )
         log_probs = log_probs[
             :, :, : self.num_action_chunks, : self.config.action_env_dim
@@ -570,6 +693,11 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         attention_mask = tokenized["attention_mask"].to(device)
         pixel_values = tokenized["pixel_values"].to(device=device, dtype=target_dtype)
         token_type_ids = tokenized["token_type_ids"].to(device)
+        history_pixels = tokenized.get("history_pixel_values")
+        history_mask = tokenized.get("history_mask")
+        if history_pixels is not None:
+            history_pixels = history_pixels.to(device=device, dtype=target_dtype)
+            history_mask = history_mask.to(device)
         batch_size = input_ids.shape[0]
         num_steps = self.num_steps
 
@@ -584,6 +712,10 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
                 attention_mask=attention_mask,
                 pixel_values=self._flatten_pixel_values(pixel_values),
                 token_type_ids=token_type_ids,
+                history_pixel_values=self._flatten_history_pixels(
+                    history_pixels, history_mask
+                ),
+                history_mask=history_mask,
                 cache_cls=DynamicCache,
             )
             prefix_len = int(prefix_hidden_states.shape[1])
@@ -660,7 +792,7 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             raise NotImplementedError("use_vlm_value is not supported for DM05")
         values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
 
-        return {
+        result = {
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
@@ -671,6 +803,10 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             "pixel_values": pixel_values,
             "token_type_ids": token_type_ids,
         }
+        if history_pixels is not None:
+            result["history_pixel_values"] = history_pixels
+            result["history_mask"] = history_mask
+        return result
 
     def get_log_prob_value(
         self,
@@ -682,19 +818,33 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         chains,
         denoise_inds,
         compute_values=False,
+        history_pixel_values=None,
+        history_mask=None,
     ):
         bsize = chains.shape[0]
+        device = chains.device
+        target_dtype = next(self.parameters()).dtype
         no_grad_ctx = (
             torch.no_grad()
             if getattr(self.config, "train_expert_only", False)
             else torch.enable_grad()
         )
         with no_grad_ctx:
+            flat_history = None
+            flat_mask = None
+            if history_pixel_values is not None and history_mask is not None:
+                flat_history = self._flatten_history_pixels(
+                    history_pixel_values.to(device=device, dtype=target_dtype),
+                    history_mask.to(device),
+                )
+                flat_mask = history_mask.to(device)
             kv_cache, prefix_hidden_states = self._compute_prefix_cache(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=self._flatten_pixel_values(pixel_values),
                 token_type_ids=token_type_ids,
+                history_pixel_values=flat_history,
+                history_mask=flat_mask,
                 cache_cls=DynamicCache,
             )
             prefix_len = int(prefix_hidden_states.shape[1])
@@ -746,6 +896,8 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
         mode = kwargs.get("mode", "train")
         compute_values = kwargs.get("compute_values", True)
         to_process_obs = self.obs_processor(env_obs)
+        if self._use_history():
+            to_process_obs["history_images"] = self._consume_history(env_obs)
         raw_state = to_process_obs["observation/state"]
         if torch.is_tensor(raw_state):
             raw_state_np = raw_state.detach().cpu().float().numpy().copy()
@@ -773,8 +925,12 @@ class DM05ForRLActionPrediction(BasePolicy, DM05ForConditionalGeneration):
             "pixel_values": outputs["pixel_values"],
             "token_type_ids": outputs["token_type_ids"],
         }
+        if outputs.get("history_pixel_values") is not None:
+            forward_inputs["history_pixel_values"] = outputs["history_pixel_values"]
+            forward_inputs["history_mask"] = outputs["history_mask"]
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
+        forward_inputs.pop("history_images", None)
         return actions, {
             "prev_logprobs": outputs["prev_logprobs"],
             "prev_values": outputs["prev_values"],

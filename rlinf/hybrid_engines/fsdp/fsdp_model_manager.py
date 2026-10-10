@@ -80,7 +80,19 @@ class FSDPModelManager:
 
         self.optimizer_steps = 0
         self.critic_warmup_steps = 0
-        if self._cfg.get("optim", {}).get(
+        # Resume from a post-warmup checkpoint must build both param groups.
+        # optimizer_steps is not stored in the checkpoint, so a fresh process
+        # would otherwise re-enter critic warmup and load a 2-group AdamW
+        # state into a 1-group optimizer (KeyError: 'betas' on the first step).
+        self.skip_critic_warmup = bool(
+            self._cfg.get("optim", {}).get("skip_critic_warmup", False)
+        )
+        if self.skip_critic_warmup:
+            self._logger.info(
+                "[FSDP] skip_critic_warmup=True. Critic warmup is disabled; "
+                "the optimizer is built with actor and value-head groups."
+            )
+        elif self._cfg.get("optim", {}).get(
             "critic_warmup_steps", None
         ) and self._cfg.model.get("add_value_head", False):
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps

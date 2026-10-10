@@ -1,12 +1,8 @@
 # 8-GPU PPO on RoboDojo build_tower (Dual ARX5 / OpenDM dm05_robodojo).
-# Collocated like the 1gpu config, with offload so Isaac and the actor
-# do not sit on the GPU at the same time.
-# 4 Isaac processes per GPU fails on this node: the 4th Kit startup hits
-# cudaErrorDevicesUnavailable (logs/20260927-17:41:12, isaac_worker_3.log)
-# while the first three never reach reset. 16 envs / 8 GPUs = 2 per GPU.
+# 16 envs / 8 GPUs = 2 Isaac per GPU. env offload closes Isaac after each interact.
 # CuRobo follows ROBODOJO_ISAAC_DEVICE, so each GPU holds that rank's planners.
-# rollout/rank = (16*4/8)*(2100/50) = 336. per-rank batch = 84, 336 % 84 = 0.
-# micro_batch_size=28, global_batch_size=672, 672 % (28*8) = 0.
+# rollout/rank = (16*4/8)*(2100/25) = 672. per-rank batch = 42, 672 % 42 = 0.
+# micro_batch_size=14, global_batch_size=336, 336 % (14*8) = 0.
 defaults:
   - env/robodojo@env.train
   - env/robodojo@env.eval
@@ -52,7 +48,8 @@ algorithm:
   reward_coef: 1.0
 
   reward_type: chunk_level
-  logprob_type: chunk_level
+  logprob_type: action_level
+  intra_chunk_advantage: True
   entropy_type: token_level
 
   update_epoch: 4
@@ -89,20 +86,23 @@ env:
     layout_mode: procedural
     use_fixed_reset_state_ids: False
     center_crop: False
-    use_dense_reward: False
-    dense_shaping_coef: 0.5
+    use_dense_reward: True
+    dense_shaping_coef: 0.7
     dense_success_reward: 1.0
     use_rel_reward: False
     use_custom_reward: True
     official_step_lim: 1050
     rollout_step_lim: 2100
-    success_deadline_mode: hard
+    # Full success reward until official_step_lim. After that,
+    # scale = exp(-(step - official) / (0.5 * official)).
+    success_deadline_mode: decay
     success_decay_steps: 525
-    time_cost_per_step: 0.0004
+    time_cost_per_step: 0.0
+    # Close Isaac after each interact so the RTX descriptor heap does not accumulate.
     enable_offload: True
     auto_task_horizon: True
     video_cfg:
-      save_video: True
+      save_video: False
       video_stride: -1
       fps: 25
     task_config:
@@ -114,7 +114,7 @@ env:
     total_num_envs: 16
     auto_reset: True
     ignore_terminations: True
-    use_dense_reward: False
+    use_dense_reward: True
     use_rel_reward: False
     use_custom_reward: True
     max_episode_steps: 1050
@@ -124,6 +124,7 @@ env:
     use_fixed_reset_state_ids: False
     is_eval: True
     layout_mode: eval_json
+    # Close Isaac after each interact so the RTX descriptor heap does not accumulate.
     enable_offload: True
     video_cfg:
       save_video: True
@@ -149,17 +150,19 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 28
-  # world_size=8: 672 % (28*8)=0；per-rank batch=84
-  # rollout/rank = (16*4/8)*(2100/50) = 336，336 % 84 = 0
-  global_batch_size: 672
+  micro_batch_size: 14
+  # world_size=8: 336 % (14*8)=0；per-rank batch=42
+  # rollout/rank = (16*4/8)*(2100/25) = 672，672 % 42 = 0
+  global_batch_size: 336
   seed: 1234
   enable_offload: True
 
   model:
-    model_path: "/kpfs_ssd/data/ruitong_gan/opendm/checkpoints/dm05_robodojo"
+    model_path: "/kpfs_ssd/data/ruitong_gan/opendm/user_checkpoints/dm05_robodojo_3task_sft/checkpoint-20000"
     precision: "bf16"
-    num_action_chunks: 50
+    # The checkpoint still predicts 50 actions. The env executes the first 25,
+    # then replans, matching the official OpenDM eval contract.
+    num_action_chunks: 25
     action_dim: 14
     add_value_head: True
     num_steps: 5
@@ -170,7 +173,12 @@ actor:
       add_state: True
       action_mode: "absolute"
       noise_level: 0.3
+      # Five denoise steps. SDE noise is applied to one of the first four only.
       ignore_last: true
+      is_history: true
+      history_slots: 20
+      # Official prompt length. History adds 32 slots * 16 tokens.
+      max_length: 1536
       action_chunk: ${actor.model.num_action_chunks}
       num_steps: ${actor.model.num_steps}
       train_expert_only: True
@@ -189,6 +197,8 @@ actor:
     weight_decay: 0.01
     clip_grad: 1.0
     critic_warmup_steps: 300
+    # Resume a checkpoint saved after warmup with this set to true.
+    skip_critic_warmup: false
 
   fsdp_config:
     strategy: "fsdp"

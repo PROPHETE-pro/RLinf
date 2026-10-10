@@ -6,7 +6,7 @@ ignore_terminations: False
 
 reward_coef: 1.0
 use_dense_reward: False
-dense_shaping_coef: 0.5
+dense_shaping_coef: 0.7
 dense_success_reward: 1.0
 use_custom_reward: True
 use_rel_reward: False
@@ -48,15 +48,19 @@ video_cfg:
   video_stride: -1
   # Matches arx_x5 observation.collect_freq so playback tracks control time.
   fps: 25
+  # Wrist images stay in the policy observation. The MP4 is the head camera only.
+  concat_wrist_cameras: False
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/train
 
+# Task configs set this True when the actor update shares the GPU with Isaac.
+# False keeps the sim alive across that update (no Kit cold start) and can OOM.
 enable_offload: False
 
 use_subproc_env: true
 auto_task_horizon: True
 subproc_step_timeout_sec: 180.0
-subproc_ready_timeout_sec: 900.0
+subproc_ready_timeout_sec: 2400.0
 subproc_max_respawns: 999999
 on_subenv_timeout: truncate
 chunk_step_timeout_sec: 0

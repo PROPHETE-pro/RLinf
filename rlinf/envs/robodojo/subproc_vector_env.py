@@ -38,12 +38,18 @@ logger = logging.getLogger(__name__)
 
 OnTimeoutPolicy = Literal["truncate", "fail"]
 _KILL_GRACE_SEC = 10.0
+# Offload close only. Isaac/Kit on H100 can spend well over 10s in
+# "Simulation App Shutting Down"; SIGKILL during that teardown leaves the
+# process unreaped and the uncaught TimeoutExpired kills the Ray job.
+# Reset/step timeout recovery keeps the short grace above.
+_CLOSE_EXIT_SEC = 120.0
 _SPAWN_READY_TIMEOUT_SEC = 900.0
 _WORKER_SCRIPT = Path(__file__).resolve().parent / "isaac_worker.py"
 _K8S_NUMBERED_PORT_RE = re.compile(r"_PORT_\d+_(TCP|UDP)")
 _CHILD_DROP_KEYS = frozenset({"LD_PRELOAD", "_STDBUF_E", "_STDBUF_O"})
 _ACCEPT_POLL_SEC = 1.0
 _LOG_TAIL_BYTES = 16384
+_CONN_ERRORS = (TimeoutError, EOFError, BrokenPipeError, ConnectionResetError)
 
 
 def _to_scalar_array(value: Any, *, dtype: np.dtype) -> np.ndarray:
@@ -401,15 +407,34 @@ class IsaacSubEnvWorker:
                 pass
             self._ipc_path = None
 
-    def _kill_process(self) -> None:
+    def _kill_process(self, grace: float = _KILL_GRACE_SEC) -> None:
         if self.process is not None:
+            pid = self.process.pid
             if self.process.poll() is None:
                 self.process.terminate()
                 try:
-                    self.process.wait(timeout=_KILL_GRACE_SEC)
+                    self.process.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "RoboDojo SubEnv %s pid=%s did not exit within %.0fs "
+                        "after SIGTERM; sending SIGKILL",
+                        self.env_id,
+                        pid,
+                        grace,
+                    )
                     self.process.kill()
-                    self.process.wait(timeout=_KILL_GRACE_SEC)
+                    try:
+                        self.process.wait(timeout=grace)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(
+                            "RoboDojo SubEnv %s pid=%s still alive %.0fs after "
+                            "SIGKILL; continuing so one stuck isaac_worker does "
+                            "not abort the job. GPU memory on this device may "
+                            "stay held until the process is reaped.",
+                            self.env_id,
+                            pid,
+                            grace,
+                        )
             else:
                 try:
                     self.process.wait(timeout=1)
@@ -481,10 +506,17 @@ class IsaacSubEnvWorker:
         elif "obs" in payload and isinstance(payload["obs"], dict):
             self._last_obs = payload["obs"]
 
-    def _send_recv(self, cmd: str, data: Any, timeout: Optional[float] = None) -> Any:
+    def _ensure_running(self) -> None:
         if self.conn is None or self.process is None or self.process.poll() is not None:
             raise RuntimeError(f"RoboDojo SubEnv {self.env_id} is not running")
+
+    def _send_only(self, cmd: str, data: Any) -> None:
+        self._ensure_running()
         self.conn.send((cmd, data))
+
+    def _recv_only(self, cmd: str, timeout: Optional[float] = None) -> Any:
+        if self.conn is None:
+            raise RuntimeError(f"RoboDojo SubEnv {self.env_id} is not running")
         wait = self.step_timeout_sec if timeout is None else timeout
         if not self.conn.poll(wait):
             raise TimeoutError(
@@ -492,22 +524,31 @@ class IsaacSubEnvWorker:
             )
         return self.conn.recv()
 
-    def step_with_timeout(self, actions: np.ndarray) -> dict:
-        start = time.time()
+    def _send_recv(self, cmd: str, data: Any, timeout: Optional[float] = None) -> Any:
+        self._send_only(cmd, data)
+        return self._recv_only(cmd, timeout=timeout)
+
+    def begin_step(self, actions: np.ndarray) -> None:
+        self._send_only("step", actions)
+
+    def _finish_failed_step(self, start: float, exc: BaseException) -> dict:
+        elapsed = time.time() - start
+        if self.on_timeout == "fail":
+            self._kill_process()
+            raise RuntimeError(
+                f"RoboDojo SubEnv {self.env_id} step timed out after {elapsed:.1f}s"
+            ) from exc
         try:
-            result = self._send_recv("step", actions)
-        except (TimeoutError, EOFError, BrokenPipeError, ConnectionResetError) as exc:
-            elapsed = time.time() - start
-            if self.on_timeout == "fail":
-                self._kill_process()
-                raise RuntimeError(
-                    f"RoboDojo SubEnv {self.env_id} step timed out after {elapsed:.1f}s"
-                ) from exc
-            try:
-                self._force_kill_and_respawn(elapsed, reason="step_timeout")
-            except Exception as recover_exc:
-                return self._truncate_result(str(recover_exc))
-            return self._truncate_result()
+            self._force_kill_and_respawn(elapsed, reason="step_timeout")
+        except Exception as recover_exc:
+            return self._truncate_result(str(recover_exc))
+        return self._truncate_result()
+
+    def finish_step(self, start: float) -> dict:
+        try:
+            result = self._recv_only("step", timeout=self.step_timeout_sec)
+        except _CONN_ERRORS as exc:
+            return self._finish_failed_step(start, exc)
         self._remember_obs(result)
         result["obs"] = self._last_obs
         result["info"] = {
@@ -516,25 +557,35 @@ class IsaacSubEnvWorker:
         }
         return normalize_step_result(result)
 
-    def reset(self, env_seed: Optional[int] = None) -> dict[str, Any]:
-        if env_seed is not None:
-            self.env_seed = int(env_seed)
+    def step_with_timeout(self, actions: np.ndarray) -> dict:
         start = time.time()
         try:
-            result = self._send_recv(
-                "reset",
-                self.env_seed,
-                timeout=max(self.step_timeout_sec, self.ready_timeout_sec),
+            self.begin_step(actions)
+        except _CONN_ERRORS as exc:
+            return self._finish_failed_step(start, exc)
+        return self.finish_step(start)
+
+    def begin_reset(self, env_seed: Optional[int] = None) -> None:
+        if env_seed is not None:
+            self.env_seed = int(env_seed)
+        self._send_only("reset", self.env_seed)
+
+    def _finish_failed_reset(self, start: float) -> dict[str, Any]:
+        elapsed = time.time() - start
+        if self.on_timeout == "fail":
+            self._kill_process()
+            raise RuntimeError(
+                f"RoboDojo SubEnv {self.env_id} reset timed out after {elapsed:.1f}s"
             )
-        except (TimeoutError, EOFError, BrokenPipeError, ConnectionResetError):
-            elapsed = time.time() - start
-            if self.on_timeout == "fail":
-                self._kill_process()
-                raise RuntimeError(
-                    f"RoboDojo SubEnv {self.env_id} reset timed out after {elapsed:.1f}s"
-                )
-            self._force_kill_and_respawn(elapsed, reason="reset_timeout")
-            return self.get_obs()
+        self._force_kill_and_respawn(elapsed, reason="reset_timeout")
+        return self.get_obs()
+
+    def finish_reset(self, start: float) -> dict[str, Any]:
+        timeout = max(self.step_timeout_sec, self.ready_timeout_sec)
+        try:
+            result = self._recv_only("reset", timeout=timeout)
+        except _CONN_ERRORS:
+            return self._finish_failed_reset(start)
         if isinstance(result, dict) and "obs" in result:
             self._remember_obs(result["obs"])
             return result["obs"]
@@ -542,6 +593,14 @@ class IsaacSubEnvWorker:
             self._remember_obs(result)
             return self._last_obs
         return self.get_obs()
+
+    def reset(self, env_seed: Optional[int] = None) -> dict[str, Any]:
+        start = time.time()
+        try:
+            self.begin_reset(env_seed)
+        except _CONN_ERRORS:
+            return self._finish_failed_reset(start)
+        return self.finish_reset(start)
 
     def get_obs(self) -> dict[str, Any]:
         try:
@@ -560,7 +619,35 @@ class IsaacSubEnvWorker:
                 self.conn.poll(min(30.0, self.step_timeout_sec))
             except (BrokenPipeError, OSError, EOFError):
                 pass
-        self._kill_process()
+            # Ack only means the worker entered env.close(). Wait for the
+            # process to leave on its own before any signal. A worker that
+            # exits in a few seconds returns here immediately.
+            if self.process is not None and self.process.poll() is None:
+                logger.info(
+                    "RoboDojo SubEnv %s pid=%s waiting up to %.0fs for "
+                    "isaac_worker to exit after close",
+                    self.env_id,
+                    self.process.pid,
+                    _CLOSE_EXIT_SEC,
+                )
+                wait_started = time.time()
+                try:
+                    self.process.wait(timeout=_CLOSE_EXIT_SEC)
+                    logger.info(
+                        "RoboDojo SubEnv %s isaac_worker exited after close "
+                        "in %.1fs without a signal",
+                        self.env_id,
+                        time.time() - wait_started,
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "RoboDojo SubEnv %s pid=%s still running %.0fs after "
+                        "close; escalating to SIGTERM",
+                        self.env_id,
+                        self.process.pid,
+                        _CLOSE_EXIT_SEC,
+                    )
+        self._kill_process(grace=_CLOSE_EXIT_SEC)
 
 
 class SubprocVectorEnv(gym.Env):
@@ -646,9 +733,21 @@ class SubprocVectorEnv(gym.Env):
         )
 
     def step(self, actions: np.ndarray) -> tuple:
-        results = []
+        # Send every step before the first recv so sibling Isaac processes overlap.
+        pending: list[tuple[IsaacSubEnvWorker, float, Optional[BaseException]]] = []
         for i, worker in enumerate(self.workers):
-            results.append(worker.step_with_timeout(actions[i]))
+            start = time.time()
+            try:
+                worker.begin_step(actions[i])
+                pending.append((worker, start, None))
+            except _CONN_ERRORS as exc:
+                pending.append((worker, start, exc))
+        results = []
+        for worker, start, send_exc in pending:
+            if send_exc is None:
+                results.append(worker.finish_step(start))
+            else:
+                results.append(worker._finish_failed_step(start, send_exc))
         return self.transform(results)
 
     def reset(
@@ -679,10 +778,22 @@ class SubprocVectorEnv(gym.Env):
                     f"RoboDojo reset env_idx={i} is outside "
                     f"0..{len(self.workers) - 1}"
                 )
+        pending: list[tuple[IsaacSubEnvWorker, float, bool]] = []
+        for i in env_idx:
             seed = None
             if env_seeds is not None:
                 seed = env_seeds[i] if i < len(env_seeds) else env_seeds[0]
-            self.workers[i].reset(seed)
+            start = time.time()
+            try:
+                self.workers[i].begin_reset(seed)
+                pending.append((self.workers[i], start, False))
+            except _CONN_ERRORS:
+                pending.append((self.workers[i], start, True))
+        for worker, start, send_failed in pending:
+            if send_failed:
+                worker._finish_failed_reset(start)
+            else:
+                worker.finish_reset(start)
 
     def get_obs(self) -> list[dict[str, Any]]:
         return [worker.get_obs() for worker in self.workers]

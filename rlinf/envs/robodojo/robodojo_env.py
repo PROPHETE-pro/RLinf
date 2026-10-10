@@ -28,6 +28,7 @@ from PIL import Image
 
 from rlinf.envs.robodojo.obs_action import ACTION_DIM
 from rlinf.envs.robodojo.reward import chunk_reward_from_cumulative, cumulative_score
+from rlinf.envs.robodojo.reward_strip import compose_frame_with_strip, render_reward_strip
 from rlinf.envs.robodojo.subproc_vector_env import SubprocVectorEnv
 from rlinf.envs.robodojo.task_inventory import COMPETITION_TASKS, get_task_horizon
 from rlinf.envs.utils import center_crop_image, list_of_dict_to_dict_of_list
@@ -49,6 +50,11 @@ class RoboDojoEnv(gym.Env):
         self.seed = env_seed + seed_offset
         self.base_seed = env_seed
         self.num_envs = num_envs
+        self._video_scores = [[] for _ in range(self.num_envs)]
+        self._video_phis = [[] for _ in range(self.num_envs)]
+        self._video_chunk_spans: list[list[tuple[int, int]]] = [
+            [] for _ in range(self.num_envs)
+        ]
         self.seed_offset = seed_offset
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
@@ -60,7 +66,7 @@ class RoboDojoEnv(gym.Env):
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.use_custom_reward = cfg.use_custom_reward
         self.use_dense_reward = bool(cfg.get("use_dense_reward", False))
-        self.dense_shaping_coef = float(cfg.get("dense_shaping_coef", 0.5))
+        self.dense_shaping_coef = float(cfg.get("dense_shaping_coef", 0.7))
         self.dense_success_reward = float(cfg.get("dense_success_reward", 1.0))
         self.success_deadline_mode = str(cfg.get("success_deadline_mode", "hard"))
         self.success_decay_steps = float(cfg.get("success_decay_steps", 525))
@@ -285,6 +291,7 @@ class RoboDojoEnv(gym.Env):
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
             self.prev_step_count[mask] = 0
+            self._clear_video_curves(env_idx)
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.success_within_official[mask] = False
@@ -294,6 +301,7 @@ class RoboDojoEnv(gym.Env):
         else:
             self.prev_step_reward[:] = 0
             self.prev_step_count[:] = 0
+            self._clear_video_curves(None)
             if self.record_metrics:
                 self.success_once[:] = False
                 self.success_within_official[:] = False
@@ -322,6 +330,13 @@ class RoboDojoEnv(gym.Env):
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        # ``return`` / ``reward`` already subtract ``time_cost_per_step``. These two
+        # add that cost back so the task score can be read on its own.
+        time_cost = self.time_cost_per_step * episode_info["episode_len"]
+        episode_info["return_no_time"] = episode_info["return"] + time_cost
+        episode_info["reward_no_time"] = (
+            episode_info["return_no_time"] / episode_info["episode_len"]
+        )
         episode_info["task_ids"] = self.task_ids_tensor.clone()
         infos["episode"] = episode_info
         return infos
@@ -366,6 +381,11 @@ class RoboDojoEnv(gym.Env):
             "states": batch_states,
             "task_descriptions": batch_instructions,
             "task_ids": self.task_ids_tensor.clone(),
+            "elapsed_steps": (
+                self._elapsed_steps.detach().to(dtype=torch.int64).clone()
+                if getattr(self, "_elapsed_steps", None) is not None
+                else torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+            ),
         }
 
     def _info_float_list(self, infos, key: str) -> list[float | None]:
@@ -548,6 +568,7 @@ class RoboDojoEnv(gym.Env):
         raw_obs, step_reward, terminations, truncations, info_list = self.venv.step(
             actions
         )[:5]
+        self._elapsed_steps += actions.shape[1]
         extracted_obs = self._extract_obs_image(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_list)
         terminations = torch.as_tensor(
@@ -559,7 +580,6 @@ class RoboDojoEnv(gym.Env):
         step_reward = self._prepare_step_reward(
             step_reward, terminations, infos, executed_steps=int(actions.shape[1])
         )
-        self._elapsed_steps += actions.shape[1]
         truncated = torch.logical_or(
             self._elapsed_steps >= self.cfg.max_episode_steps,
             self._elapsed_steps >= self.per_env_horizons,
@@ -587,9 +607,12 @@ class RoboDojoEnv(gym.Env):
             info_list,
             video_frames,
         ) = self.venv.step(chunk_actions)
+        self._elapsed_steps += chunk_actions.shape[1]
         extracted_obs = self._extract_obs_image(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_list)
-        obs_list = self._head_video_obs_list(video_frames, extracted_obs)
+        obs_list = self._head_video_obs_list(
+            video_frames, extracted_obs, infos, terminations
+        )
         infos_list = [infos]
         terminations = torch.as_tensor(
             np.array(terminations).reshape(-1), device=self.device
@@ -608,7 +631,6 @@ class RoboDojoEnv(gym.Env):
         else:
             chunk_rewards = traced
             step_reward = traced.sum(dim=-1)
-        self._elapsed_steps += chunk_actions.shape[1]
         truncated = torch.logical_or(
             self._elapsed_steps >= self.cfg.max_episode_steps,
             self._elapsed_steps >= self.per_env_horizons,
@@ -671,11 +693,99 @@ class RoboDojoEnv(gym.Env):
         except (TypeError, ValueError):
             return -1
 
-    def _head_video_obs_list(self, video_frames, extracted_obs) -> list:
+    def _clear_video_curves(self, env_idx=None) -> None:
+        if not hasattr(self, "_video_scores"):
+            return
+        if env_idx is None:
+            indices = range(self.num_envs)
+        elif isinstance(env_idx, torch.Tensor):
+            indices = [int(i) for i in env_idx.detach().cpu().reshape(-1).tolist()]
+        else:
+            indices = [int(i) for i in env_idx]
+        for index in indices:
+            if index < 0 or index >= self.num_envs:
+                continue
+            self._video_scores[index].clear()
+            self._video_phis[index].clear()
+            self._video_chunk_spans[index].clear()
+
+    def _video_horizon(self) -> int:
+        horizon = getattr(self.cfg, "max_episode_steps", None)
+        try:
+            horizon = int(horizon)
+        except (TypeError, ValueError):
+            horizon = 0
+        return horizon if horizon > 0 else 1
+
+    def _extend_video_curve(
+        self,
+        env_index: int,
+        trace,
+        step_count: int | None,
+        terminated: bool,
+    ) -> None:
+        """Append this chunk's cumulative score, matching ``probe_first_chunk``."""
+        if not trace:
+            return
+        base = len(self._video_scores[env_index])
+        chunk_start = base
+        used = list(trace)
+        for offset, phi in enumerate(used):
+            last = offset == len(used) - 1
+            count = (
+                int(step_count)
+                if last and step_count is not None
+                else base + offset + 1
+            )
+            phi_value = float(phi)
+            score = cumulative_score(
+                success=bool(terminated) and last,
+                step_count=count,
+                official_step_lim=int(self.official_step_lims[env_index]),
+                deadline_mode=self.success_deadline_mode,
+                decay_steps=self.success_decay_steps,
+                dense_progress=phi_value,
+                use_dense_reward=True,
+                shaping_coef=self.dense_shaping_coef,
+                success_reward=self.dense_success_reward * float(self.cfg.reward_coef),
+            )
+            self._video_scores[env_index].append(score)
+            self._video_phis[env_index].append(phi_value)
+        self._video_chunk_spans[env_index].append(
+            (chunk_start, len(self._video_scores[env_index]))
+        )
+
+    @staticmethod
+    def _stack_video_frames(images: list[np.ndarray | None]) -> np.ndarray:
+        """Stack per-env frames. Missing or odd-sized frames match the first real one."""
+        target = next((image.shape for image in images if image is not None), (1, 1, 3))
+        fitted = []
+        for image in images:
+            if image is None:
+                fitted.append(np.zeros(target, dtype=np.uint8))
+                continue
+            frame = np.asarray(image)
+            if frame.ndim == 2:
+                frame = np.repeat(frame[..., None], 3, axis=-1)
+            if frame.ndim == 3 and frame.shape[-1] == 4:
+                frame = frame[..., :3]
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            if frame.shape != target:
+                frame = np.asarray(
+                    Image.fromarray(frame).resize((int(target[1]), int(target[0])))
+                )
+            fitted.append(frame)
+        return np.stack(fitted)
+
+    def _head_video_obs_list(
+        self, video_frames, extracted_obs, infos=None, terminations=None
+    ) -> list:
         """Head-camera frames for RecordVideo. The last item stays the policy obs.
 
         Wrist images are not included. ``video_frames`` is one list of HWC uint8
-        arrays per env, already subsampled in the Isaac worker.
+        arrays per env, already subsampled in the Isaac worker. Each action frame
+        gets the same score curve as ``probe_first_chunk``.
         """
         if not self._save_video_enabled() or not video_frames:
             return [extracted_obs]
@@ -683,21 +793,68 @@ class RoboDojoEnv(gym.Env):
         n_frames = max(lengths) if lengths else 0
         if n_frames <= 1:
             return [extracted_obs]
+        traces = []
+        step_counts = []
+        terminated_flags: list[bool] = []
+        if isinstance(infos, dict):
+            traces = infos.get("dense_progress_trace") or []
+            step_counts = self._info_int_list(infos, "step_count")
+        if terminations is not None:
+            terminated_flags = [
+                bool(value) for value in np.asarray(terminations).reshape(-1)
+            ]
+        # Append this chunk onto the episode curve before drawing. ``t`` is only
+        # the index inside the chunk; the yellow cursor has to stay on the
+        # episode step, or every chunk redraws the plot from step 0.
+        chunk_bases: list[int] = []
+        for env_index, _frames in enumerate(video_frames):
+            chunk_bases.append(len(self._video_scores[env_index]))
+            if env_index >= len(traces):
+                continue
+            step_count = (
+                step_counts[env_index] if env_index < len(step_counts) else None
+            )
+            terminated = (
+                terminated_flags[env_index]
+                if env_index < len(terminated_flags)
+                else False
+            )
+            self._extend_video_curve(
+                env_index, traces[env_index], step_count, terminated
+            )
         sequence = []
-        for t in range(n_frames - 1):
-            images = []
-            for frames in video_frames:
+        for t in range(n_frames):
+            images: list[np.ndarray | None] = []
+            for env_index, frames in enumerate(video_frames):
                 frames = frames or []
                 if not frames:
-                    images.append(np.zeros((1, 1, 3), dtype=np.uint8))
+                    # A timed-out or already-finished env has no frames. Leave a
+                    # hole and fill it once the other cameras set the shape.
+                    images.append(None)
                     continue
                 src = frames[t] if t < len(frames) else frames[-1]
-                images.append(
-                    self.center_and_crop(src, center_crop=self.center_crop)
+                image = self.center_and_crop(src, center_crop=self.center_crop)
+                episode_scores = self._video_scores[env_index]
+                cursor = min(chunk_bases[env_index] + t + 1, len(episode_scores))
+                scores = episode_scores[:cursor]
+                phis = self._video_phis[env_index][:cursor]
+                spans = [
+                    (start, min(end, cursor))
+                    for start, end in self._video_chunk_spans[env_index]
+                    if start < cursor
+                ]
+                strip = render_reward_strip(
+                    int(image.shape[1]),
+                    self._video_horizon(),
+                    scores,
+                    spans,
+                    cursor,
+                    phis[-1] if phis else None,
                 )
+                images.append(compose_frame_with_strip(image, strip))
             sequence.append(
                 {
-                    "main_images": np.stack(images),
+                    "main_images": self._stack_video_frames(images),
                     "task_descriptions": list(self.per_env_task_names),
                 }
             )
